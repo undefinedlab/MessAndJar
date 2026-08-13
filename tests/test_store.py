@@ -68,9 +68,10 @@ def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatc
     client = TestClient(app)
 
     name = f"web-{uuid.uuid4().hex[:8]}"
+    repo = f"github.com/acme/{name}"
     created = client.post(
         "/api/jars",
-        json={"name": name, "password": "share-me", "repos": ["github.com/acme/web"]},
+        json={"name": name, "password": "share-me", "repos": [repo]},
     )
     assert created.status_code == 200
     assert created.json()["agents"] == []
@@ -93,10 +94,10 @@ def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatc
 
     added = client.post(
         "/api/jars/repos",
-        json={"jar": name, "password": "share-me", "repos": ["github.com/acme/web-ui"]},
+        json={"jar": name, "password": "share-me", "repos": [f"{repo}-ui"]},
     )
     assert added.status_code == 200
-    assert "github.com/acme/web-ui" in added.json()["repos"]
+    assert f"{repo}-ui" in added.json()["repos"]
 
     page = client.get(f"/j/{name}?p=share-me")
     assert page.status_code == 200
@@ -121,11 +122,11 @@ def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatc
                 "to": "sam@claude",
                 "body": "hi",
                 "kind": "question",
-                "repo": "github.com/acme/web",
+                "repo": repo,
             },
         },
     )
-    assert sent.status_code == 200
+    assert sent.status_code == 200, sent.text
     store.close()
 
 
