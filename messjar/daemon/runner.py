@@ -9,6 +9,7 @@ from typing import Any
 
 from messjar.client import BusClient
 from messjar.daemon.adapters import get_adapter
+from messjar.notify import notify_mess
 from messjar.schema import MessKind
 
 log = logging.getLogger("messjar.daemon")
@@ -28,6 +29,7 @@ class Daemon:
         max_hops: int = 32,
         auto_reply: bool = True,
         password: str | None = None,
+        notify: bool = True,
     ) -> None:
         self.bus = BusClient(bus_url, password=password)
         self.agent_id = agent_id
@@ -38,6 +40,7 @@ class Daemon:
         self.poll_s = poll_s
         self.max_hops = max_hops
         self.auto_reply = auto_reply
+        self.notify = notify
         self._stop = False
 
     def stop(self) -> None:
@@ -81,6 +84,10 @@ class Daemon:
             hop,
         )
 
+        if self.notify:
+            ok = notify_mess(jar, mess)
+            log.info("desktop notify %s", "sent" if ok else "skipped")
+
         local = (jar.get("local") or {}).get(self.agent_id) or {}
         if jar.get("paused") or local.get("paused"):
             log.info("skip paused jar/agent")
@@ -90,8 +97,7 @@ class Daemon:
             log.warning("hop limit %s reached; not invoking", self.max_hops)
             return
 
-        # fyi: queue semantics — only run if we are already "awake" via other traffic;
-        # for MVP we still surface FYIs but do not auto-reply.
+        # fyi: notify already fired; queue without spawning an agent
         wakes = kind in (
             MessKind.question.value,
             MessKind.handoff.value,

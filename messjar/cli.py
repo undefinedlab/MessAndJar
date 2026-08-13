@@ -210,6 +210,9 @@ def daemon_run(
         None, "--password", "-p", envvar="MESSJAR_PASSWORD"
     ),
     dry_run: bool = typer.Option(False, "--dry-run"),
+    notify: bool = typer.Option(
+        True, "--notify/--no-notify", help="Desktop notification when a Mess arrives"
+    ),
     poll: float = typer.Option(2.0, "--poll"),
     max_hops: int = typer.Option(32, "--max-hops"),
     once: bool = typer.Option(False, "--once", help="Poll once and exit"),
@@ -231,6 +234,7 @@ def daemon_run(
         poll_s=poll,
         max_hops=max_hops,
         password=password,
+        notify=notify,
     )
     if once:
         n = d.poll_once()

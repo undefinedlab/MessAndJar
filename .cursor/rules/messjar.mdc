@@ -1,0 +1,7 @@
+# Mess&Jar (this machine)
+
+- **Agent id:** `zen@cursor`
+- **MCP:** global Cursor config `~/.cursor/mcp.json` → server `messjar`
+- **Daemon:** systemd user unit `messjar-daemon.service` (auto-start)
+
+When collaborating via Mess&Jar, pass `workdir` or `repo` so the bus picks the right jar. Use agent id `zen@cursor` as `from` / when checking jars.
