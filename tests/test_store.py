@@ -65,68 +65,90 @@ def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("MESSJAR_PASSWORD", raising=False)
     store = Store(database_url, min_size=1, max_size=2)
     app = create_app(store)
-    client = TestClient(app)
+    with TestClient(app) as client:
+        name = f"web-{uuid.uuid4().hex[:8]}"
+        repo = f"github.com/acme/{name}"
+        created = client.post(
+            "/api/jars",
+            json={"name": name, "password": "share-me", "repos": [repo]},
+        )
+        assert created.status_code == 200
+        assert created.json()["agents"] == []
 
-    name = f"web-{uuid.uuid4().hex[:8]}"
-    repo = f"github.com/acme/{name}"
-    created = client.post(
-        "/api/jars",
-        json={"name": name, "password": "share-me", "repos": [repo]},
-    )
-    assert created.status_code == 200
-    assert created.json()["agents"] == []
-
-    joined = client.post(
-        "/api/join",
-        json={
-            "jar": name,
-            "password": "share-me",
-            "tool": "cursor",
-            "display_name": "Alex",
-        },
-    )
-    assert joined.status_code == 200
-    assert joined.json()["agent_id"] == "alex@cursor"
-
-    detail = client.get(f"/api/jars/{name}/detail", params={"p": "share-me"})
-    assert detail.status_code == 200
-    assert "alex@cursor" in detail.json()["agents"]
-
-    added = client.post(
-        "/api/jars/repos",
-        json={"jar": name, "password": "share-me", "repos": [f"{repo}-ui"]},
-    )
-    assert added.status_code == 200
-    assert f"{repo}-ui" in added.json()["repos"]
-
-    page = client.get(f"/j/{name}?p=share-me")
-    assert page.status_code == 200
-    assert "Members" in page.text
-    assert "Add repo key" in page.text
-    assert "Recent messes" in page.text
-
-    friend = client.post(
-        "/api/join",
-        json={"jar": name, "password": "share-me", "tool": "claude", "display_name": "Sam"},
-    )
-    assert friend.status_code == 200
-
-    token = joined.json()["token"]
-    sent = client.post(
-        "/mcp/call",
-        headers={"Authorization": f"Bearer {token}"},
-        json={
-            "name": "send",
-            "arguments": {
-                "from": "alex@cursor",
-                "to": "sam@claude",
-                "body": "hi",
-                "kind": "question",
-                "repo": repo,
+        joined = client.post(
+            "/api/join",
+            json={
+                "jar": name,
+                "password": "share-me",
+                "tool": "cursor",
+                "display_name": "Alex",
             },
-        },
-    )
-    assert sent.status_code == 200, sent.text
+        )
+        assert joined.status_code == 200
+        assert joined.json()["agent_id"] == "alex@cursor"
+
+        detail = client.get(f"/api/jars/{name}/detail", params={"p": "share-me"})
+        assert detail.status_code == 200
+        assert "alex@cursor" in detail.json()["agents"]
+
+        added = client.post(
+            "/api/jars/repos",
+            json={"jar": name, "password": "share-me", "repos": [f"{repo}-ui"]},
+        )
+        assert added.status_code == 200
+        assert f"{repo}-ui" in added.json()["repos"]
+
+        page = client.get(f"/j/{name}?p=share-me")
+        assert page.status_code == 200
+        assert "Members" in page.text
+        assert "Add repo key" in page.text
+        assert "Recent messes" in page.text
+
+        friend = client.post(
+            "/api/join",
+            json={"jar": name, "password": "share-me", "tool": "claude", "display_name": "Sam"},
+        )
+        assert friend.status_code == 200
+
+        token = joined.json()["token"]
+        sent = client.post(
+            "/rpc/call",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "name": "send",
+                "arguments": {
+                    "from": "alex@cursor",
+                    "to": "sam@claude",
+                    "body": "hi",
+                    "kind": "question",
+                    "repo": repo,
+                },
+            },
+        )
+        assert sent.status_code == 200, sent.text
+
+        # Streamable HTTP MCP initialize (what Cursor expects at /mcp)
+        init = client.post(
+            "/mcp",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "0"},
+                },
+            },
+        )
+        assert init.status_code == 200, init.text
+        payload = init.json()
+        assert payload.get("result", {}).get("serverInfo", {}).get("name") == "messjar"
     store.close()
 
 

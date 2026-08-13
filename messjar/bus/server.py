@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from starlette.middleware import Middleware
 
 from messjar.auth import (
     AuthContext,
@@ -18,6 +20,8 @@ from messjar.auth import (
     extract_password,
     passwords_match,
 )
+from messjar.mcp_auth_asgi import mcp_auth_middleware
+from messjar.mcp_protocol import build_mcp
 from messjar.schema import AgentLocalState, Jar, Mess, MessKind
 from messjar.share import agent_mcp_bundle, connection_bundle
 from messjar.store import Store, database_host_label, normalize_database_url
@@ -117,7 +121,26 @@ def _request_base(request: Request) -> str:
 
 
 def create_app(store: Store) -> FastAPI:
-    app = FastAPI(title="Mess&Jar", version="0.1.0")
+    mcp = build_mcp()
+    # Real MCP for Cursor: Streamable HTTP at /mcp (Bearer agent key).
+    # Legacy JSON for the Python daemon stays under /rpc/*.
+    mcp_http = mcp.http_app(
+        path="/mcp",
+        stateless_http=True,
+        json_response=True,
+        transport="http",
+        host_origin_protection=False,
+        allowed_hosts=["*"],
+        allowed_origins=["*"],
+        middleware=[Middleware(mcp_auth_middleware(store))],
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with mcp_http.lifespan(app):
+            yield
+
+    app = FastAPI(title="Mess&Jar", version="0.1.0", lifespan=lifespan)
     app.state.store = store
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 
@@ -533,14 +556,13 @@ def create_app(store: Store) -> FastAPI:
             ],
         }
 
-    @app.get("/mcp")
-    @app.get("/mcp/tools")
-    def mcp_tools(auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
+    @app.get("/rpc/tools")
+    def rpc_tools(auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
         _ = auth
         return _mcp_tool_list()
 
-    @app.post("/mcp/call")
-    def mcp_call(
+    @app.post("/rpc/call")
+    def rpc_call(
         payload: dict[str, Any], auth: AuthContext = Depends(resolve_auth)
     ) -> dict[str, Any]:
         name = payload.get("name")
@@ -662,6 +684,9 @@ def create_app(store: Store) -> FastAPI:
         if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
+
+    # Catch-all after REST routes: Streamable HTTP MCP lives at /mcp
+    app.mount("/", mcp_http)
 
     return app
 

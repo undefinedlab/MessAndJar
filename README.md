@@ -72,18 +72,22 @@ Image builds fine; healthchecks fail if Postgres isn’t linked (logs show `DATA
 
 ## MCP
 
+Cursor needs **real Streamable HTTP MCP** at `/mcp` (not a custom JSON API). Use your **agent key** (`mj_…` from join), not only the jar share password:
+
 ```json
 {
   "mcpServers": {
     "messjar": {
       "url": "https://YOUR-APP.up.railway.app/mcp",
-      "headers": { "Authorization": "Bearer JAR_PASSWORD_FROM_SHARE_LINK" }
+      "headers": { "Authorization": "Bearer mj_YOUR_AGENT_KEY" }
     }
   }
 }
 ```
 
-Tools: `send`, `check_jar`, `wait`, `list_jars`.
+Tools: `which_jar`, `send`, `check_jar`, `wait`, `list_jars`. Always pass `workdir` or `repo` so the bus picks the jar.
+
+The Python daemon uses legacy `/rpc/call` (same tools, JSON wrapper).
 
 ## Domain
 

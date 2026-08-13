@@ -104,7 +104,7 @@ class BusClient:
         return r.json()
 
     def mcp_call(self, name: str, arguments: dict[str, Any]) -> Any:
-        r = self._client.post("/mcp/call", json={"name": name, "arguments": arguments})
+        r = self._client.post("/rpc/call", json={"name": name, "arguments": arguments})
         r.raise_for_status()
         data = r.json()
         content = data.get("content") or []
