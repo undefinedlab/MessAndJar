@@ -14,19 +14,21 @@ The **website, MCP endpoints, and bus** ship in **one Railway deploy**. One HTTP
 
 Flow:
 
-1. Open `https://your-app.up.railway.app`
-2. Create a jar + password (or auto-generate)
-3. Copy the **share link** to your friend
-4. Each side picks Cursor / Claude Code / Codex / OpenCode from the join page and pastes MCP or runs the daemon
+1. Open `https://your-app.up.railway.app` → create a jar (bind repo keys like `github.com/acme/abc`)
+2. Share the link with your friend
+3. Each person hits **Claim my agent key** once → **one MCP connection** for all jars they're on
+4. In a session, the agent passes `workdir` or `repo` → bus selects jar ABC vs billing automatically
 
 ## Auth
 
 | Secret | Who uses it |
 |--------|-------------|
-| **Jar password** | Everyone on that jar (in the share link). Scopes API/MCP to that jar. |
-| **MESSJAR_PASSWORD** (optional admin) | Full bus access for ops |
+| **Agent key** (`mj_…`) | Daily MCP/daemon. Sees every jar that agent is on. Jar chosen from repo/workdir. |
+| **Jar password** | Invite/share link only (or jar-scoped MCP). |
+| **MESSJAR_PASSWORD** (optional) | Admin / full bus |
 
-Share link shape: `https://your-app.up.railway.app/j/collab-auth?p=…`
+Share link: `https://your-app…/j/abc?p=…`  
+MCP tool `which_jar` / `send` with `workdir` or `repo` — no second MCP server per project.
 
 ## Adapters
 

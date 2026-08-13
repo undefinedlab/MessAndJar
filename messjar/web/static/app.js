@@ -6,8 +6,12 @@ async function createJar(event) {
   const a = document.getElementById("agent_a").value.trim();
   const b = document.getElementById("agent_b").value.trim();
   const password = document.getElementById("password").value.trim();
+  const reposRaw = document.getElementById("repos").value.trim();
   const payload = { name, agents: [a, b] };
   if (password) payload.password = password;
+  if (reposRaw) {
+    payload.repos = reposRaw.split(",").map((s) => s.trim()).filter(Boolean);
+  }
 
   try {
     const res = await fetch("/api/jars", {

@@ -12,7 +12,7 @@
 <body>
   <main class="shell">
     <h1 class="brand">Mess<span>&</span>Jar</h1>
-    <p class="lede">You're invited to jar <strong>{{ jar }}</strong>. Pick your tool, paste the config, run the daemon.</p>
+    <p class="lede">You're invited to jar <strong>{{ jar }}</strong>. Claim one agent key for <em>all</em> your jars — MCP picks the jar from the repo you're in.</p>
 
     {% if error %}
     <section class="panel">
@@ -24,21 +24,40 @@
       <div class="meta">
         <div>Bus <strong>{{ bus_url }}</strong></div>
         <div>Jar <strong>{{ jar }}</strong></div>
+        <div>Repos keys <strong>{{ repos | join(', ') }}</strong></div>
         <div>Password <strong>{{ password }}</strong></div>
         <div>Agents <strong>{{ agents | join(', ') }}</strong></div>
       </div>
 
+      <h2>One MCP for every jar</h2>
+      <p class="hint">Pick your agent id on this jar, claim a durable key once. Reuse it when you join more jars later.</p>
+      <label for="claim-agent">Your agent id</label>
+      <select id="claim-agent">
+        {% for a in agents %}
+        <option value="{{ a }}">{{ a }}</option>
+        {% endfor %}
+      </select>
       <div class="actions">
-        <button type="button" class="secondary" data-copy="{{ share_url }}">Copy share link</button>
-        <button type="button" class="secondary" data-copy="{{ password }}">Copy password</button>
+        <button type="button" id="claim-btn">Claim my agent key</button>
       </div>
+      <p id="claim-err" class="error hidden"></p>
+      <div id="claim-result" class="hidden" style="margin-top:1rem">
+        <div class="meta">
+          <div>Agent key <strong id="out-token"></strong></div>
+        </div>
+        <p class="hint" id="out-hint"></p>
+        <div class="mono" id="agent-mcp-block"></div>
+        <button type="button" class="secondary" data-copy-target="agent-mcp-block">Copy MCP JSON</button>
+      </div>
+    </section>
 
-      <h2 style="margin-top:1.4rem">MCP (Cursor / Claude / Codex / OpenCode)</h2>
-      <p class="hint">Add this server in your MCP settings. Same password for everyone on this jar.</p>
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Jar-only MCP (optional)</h2>
+      <p class="hint">Scoped to this jar only — prefer the agent key above if you juggle multiple projects.</p>
       <div class="mono" id="mcp-block">{{ mcp_json_text }}</div>
-      <button type="button" class="secondary" data-copy-target="mcp-block">Copy MCP JSON</button>
+      <button type="button" class="secondary" data-copy-target="mcp-block">Copy jar MCP JSON</button>
 
-      <h2 style="margin-top:1.4rem">Daemon (unattended)</h2>
+      <h2 style="margin-top:1.4rem">Daemon</h2>
       <div class="tabs" id="daemon-tabs">
         <button type="button" class="tab active" data-tool="cursor">Cursor</button>
         <button type="button" class="tab" data-tool="claude_code">Claude Code</button>
@@ -47,12 +66,9 @@
       </div>
       <div class="mono" id="daemon-block">{{ daemon.cursor }}</div>
       <button type="button" class="secondary" data-copy-target="daemon-block">Copy command</button>
-
-      <h2 style="margin-top:1.4rem">CLI env</h2>
-      <div class="mono" id="env-block">{{ cli_export }}</div>
-      <button type="button" class="secondary" data-copy-target="env-block">Copy env</button>
     </section>
     <script type="application/json" id="daemon-json">{{ daemon | tojson }}</script>
+    <script type="application/json" id="claim-meta">{{ {"jar": jar, "password": password} | tojson }}</script>
     {% endif %}
 
     <p class="foot"><a href="/">Create another jar</a></p>
@@ -70,13 +86,6 @@
         if (block) block.textContent = daemonMap[tab.dataset.tool] || '';
       });
     });
-    document.querySelectorAll('[data-copy]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        await navigator.clipboard.writeText(btn.getAttribute('data-copy') || '');
-        btn.textContent = 'Copied';
-        setTimeout(() => { btn.textContent = btn.textContent.replace('Copied', btn.dataset.label || 'Copy'); }, 900);
-      });
-    });
     document.querySelectorAll('[data-copy-target]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const t = document.getElementById(btn.getAttribute('data-copy-target'));
@@ -86,6 +95,34 @@
         setTimeout(() => { btn.textContent = old; }, 900);
       });
     });
+    const claimBtn = document.getElementById('claim-btn');
+    if (claimBtn) {
+      const meta = JSON.parse(document.getElementById('claim-meta').textContent);
+      claimBtn.addEventListener('click', async () => {
+        const err = document.getElementById('claim-err');
+        err.classList.add('hidden');
+        try {
+          const res = await fetch('/api/agent-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent_id: document.getElementById('claim-agent').value,
+              jar: meta.jar,
+              password: meta.password,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'claim failed');
+          document.getElementById('claim-result').classList.remove('hidden');
+          document.getElementById('out-token').textContent = data.token;
+          document.getElementById('out-hint').textContent = data.hint || '';
+          document.getElementById('agent-mcp-block').textContent = data.mcp_json_text;
+        } catch (e) {
+          err.textContent = e.message || String(e);
+          err.classList.remove('hidden');
+        }
+      });
+    }
   </script>
 </body>
 </html>

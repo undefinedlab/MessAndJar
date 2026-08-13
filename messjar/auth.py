@@ -1,11 +1,8 @@
 """Auth for Mess&Jar.
 
-Two levels:
 - Admin: MESSJAR_PASSWORD — full bus access (optional)
-- Jar password: set when creating a Jar — scoped to that jar (what you share)
-
-Clients send: Authorization: Bearer <password>
-         or: X-MessJar-Password: <password>
+- Jar password: invite/share — scoped to that jar
+- Agent key: one MCP credential — all jars that agent is on; jar picked by repo/workdir
 """
 
 from __future__ import annotations
@@ -21,11 +18,16 @@ class AuthContext:
     admin: bool = False
     jar_id: str | None = None
     jar_name: str | None = None
+    agent_id: str | None = None  # set when Bearer is an agent key
     open_bus: bool = False
 
-    def allows_jar(self, jar_id: str, jar_name: str | None = None) -> bool:
+    def allows_jar(self, jar_id: str, jar_name: str | None = None, agents: list[str] | None = None) -> bool:
         if self.open_bus or self.admin:
             return True
+        if self.agent_id:
+            if agents is not None:
+                return self.agent_id in agents
+            return True  # store layer should re-check membership
         if self.jar_id and self.jar_id == jar_id:
             return True
         if jar_name and self.jar_name and self.jar_name == jar_name:
@@ -63,3 +65,7 @@ def extract_password(
 
 def generate_password() -> str:
     return secrets.token_urlsafe(18)
+
+
+def generate_agent_key() -> str:
+    return "mj_" + secrets.token_urlsafe(24)

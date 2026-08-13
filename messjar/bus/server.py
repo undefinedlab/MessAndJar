@@ -18,8 +18,8 @@ from messjar.auth import (
     extract_password,
     passwords_match,
 )
-from messjar.schema import AgentLocalState, Mess, MessKind
-from messjar.share import connection_bundle
+from messjar.schema import AgentLocalState, Jar, Mess, MessKind
+from messjar.share import agent_mcp_bundle, connection_bundle
 from messjar.store import Store, database_host_label, normalize_database_url
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -31,11 +31,18 @@ class CreateJarBody(BaseModel):
     name: str
     agents: list[str]
     password: str | None = None
+    repos: list[str] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
-class SendBody(BaseModel):
+class ClaimKeyBody(BaseModel):
+    agent_id: str
     jar: str
+    password: str
+
+
+class SendBody(BaseModel):
+    jar: str | None = None
     from_agent: str = Field(alias="from")
     to_agent: str = Field(alias="to")
     body: str
@@ -43,6 +50,8 @@ class SendBody(BaseModel):
     reply_expected: bool | None = None
     hop: int = 0
     refs: list[str] = Field(default_factory=list)
+    repo: str | None = None
+    workdir: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -53,6 +62,8 @@ class CheckBody(BaseModel):
     after_seq: int | None = None
     limit: int = 50
     ack: bool = True
+    repo: str | None = None
+    workdir: str | None = None
 
 
 class WaitBody(BaseModel):
@@ -60,6 +71,15 @@ class WaitBody(BaseModel):
     jar: str | None = None
     after_seq: int | None = None
     timeout_s: float = 30.0
+    repo: str | None = None
+    workdir: str | None = None
+
+
+class WhichJarBody(BaseModel):
+    agent: str
+    jar: str | None = None
+    repo: str | None = None
+    workdir: str | None = None
 
 
 class ListJarsBody(BaseModel):
@@ -74,12 +94,13 @@ class AckBody(BaseModel):
 
 
 class LocalStateBody(BaseModel):
-    jar: str
+    jar: str | None = None
     agent: str
     workdir: str | None = None
     session_id: str | None = None
     hop: int | None = None
     paused: bool | None = None
+    repo: str | None = None
 
 
 def _request_base(request: Request) -> str:
@@ -103,37 +124,61 @@ def create_app(store: Store) -> FastAPI:
         admin = configured_password()
         provided = extract_password(authorization, x_messjar_password)
 
-        if not admin:
-            # No admin secret: jar passwords still work; bare open only if also no jar pw provided
-            if not provided:
-                # Allow open only when explicitly enabled
-                if os.environ.get("MESSJAR_OPEN", "").lower() in ("1", "true", "yes"):
-                    return AuthContext(open_bus=True)
-                raise HTTPException(401, "unauthorized: provide jar password")
-            jar = store.get_jar_by_password(provided)
-            if jar:
-                return AuthContext(jar_id=jar.id, jar_name=jar.name)
-            raise HTTPException(401, "unauthorized: bad or missing password")
-
         if not provided:
-            raise HTTPException(401, "unauthorized: bad or missing password")
-        if passwords_match(provided, admin):
+            if os.environ.get("MESSJAR_OPEN", "").lower() in ("1", "true", "yes"):
+                return AuthContext(open_bus=True)
+            raise HTTPException(401, "unauthorized: provide agent key or jar password")
+
+        if admin and passwords_match(provided, admin):
             return AuthContext(admin=True)
+
+        agent_id = store.get_agent_by_token(provided)
+        if agent_id:
+            return AuthContext(agent_id=agent_id)
+
         jar = store.get_jar_by_password(provided)
         if jar:
             return AuthContext(jar_id=jar.id, jar_name=jar.name)
+
         raise HTTPException(401, "unauthorized: bad or missing password")
 
-    def require_jar_access(auth: AuthContext, jar_id: str, jar_name: str | None = None) -> None:
-        if not auth.allows_jar(jar_id, jar_name):
-            raise HTTPException(403, "forbidden: password is not for this jar")
+    def require_jar_access(auth: AuthContext, jar: Jar) -> None:
+        if not auth.allows_jar(jar.id, jar.name, jar.agents):
+            raise HTTPException(403, "forbidden: not allowed on this jar")
+
+    def pick_jar(
+        auth: AuthContext,
+        *,
+        agent: str | None = None,
+        jar: str | None = None,
+        repo: str | None = None,
+        workdir: str | None = None,
+        required: bool = True,
+    ) -> Jar | None:
+        agent_id = agent or auth.agent_id
+        # jar-password auth forces that jar unless explicit override matches
+        if auth.jar_name and not jar and not repo and not workdir:
+            found = store.get_jar(auth.jar_id or auth.jar_name)
+            if found:
+                require_jar_access(auth, found)
+                return found
+        try:
+            found = store.resolve_jar(
+                agent_id=agent_id if not auth.admin else agent_id,
+                jar=jar or auth.jar_name,
+                repo=repo,
+                workdir=workdir,
+            )
+        except (KeyError, ValueError, PermissionError) as e:
+            if required:
+                raise HTTPException(400, str(e)) from e
+            return None
+        require_jar_access(auth, found)
+        return found
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {
-            "status": "ok",
-            "auth": "jar-or-admin" if configured_password() else "jar",
-        }
+        return {"status": "ok", "auth": "agent-key|jar|admin"}
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> FileResponse:
@@ -143,7 +188,7 @@ def create_app(store: Store) -> FastAPI:
     def share_page(
         request: Request,
         jar_name: str,
-        p: str | None = Query(default=None, description="Jar password"),
+        p: str | None = Query(default=None),
     ) -> HTMLResponse:
         jar = store.get_jar(jar_name)
         if not jar or not p or not jar.password or not passwords_match(p, jar.password):
@@ -158,14 +203,16 @@ def create_app(store: Store) -> FastAPI:
             jar_name=jar.name,
             password=jar.password,
             agents=jar.agents,
+            repos=jar.repos,
         )
         return templates.TemplateResponse(request, "share.html", {"error": None, **bundle})
 
     @app.post("/api/jars")
     def public_create_jar(request: Request, body: CreateJarBody) -> dict[str, Any]:
-        """Create a jar from the website — returns share link + password."""
         try:
-            jar = store.create_jar(body.name, body.agents, body.meta, password=body.password)
+            jar = store.create_jar(
+                body.name, body.agents, body.meta, password=body.password, repos=body.repos
+            )
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         assert jar.password
@@ -174,14 +221,31 @@ def create_app(store: Store) -> FastAPI:
             jar_name=jar.name,
             password=jar.password,
             agents=jar.agents,
+            repos=jar.repos,
         )
         return {
             "id": jar.id,
             "jar": jar.name,
             "agents": jar.agents,
+            "repos": jar.repos,
             "password": jar.password,
             "share_url": bundle["share_url"],
             "bundle": bundle,
+        }
+
+    @app.post("/api/agent-key")
+    def claim_agent_key(request: Request, body: ClaimKeyBody) -> dict[str, Any]:
+        """Prove jar membership → durable agent key for one MCP across all your jars."""
+        jar = store.get_jar(body.jar)
+        if not jar or not jar.password or not passwords_match(body.password, jar.password):
+            raise HTTPException(401, "bad jar password")
+        if body.agent_id not in jar.agents:
+            raise HTTPException(403, f"{body.agent_id} is not a participant on {jar.name}")
+        agent_id, token = store.upsert_agent_key(body.agent_id)
+        return {
+            "agent_id": agent_id,
+            "token": token,
+            **agent_mcp_bundle(base_url=_request_base(request), agent_id=agent_id, token=token),
         }
 
     @app.post("/jars")
@@ -191,10 +255,11 @@ def create_app(store: Store) -> FastAPI:
         auth: AuthContext = Depends(resolve_auth),
     ) -> dict[str, Any]:
         if not (auth.admin or auth.open_bus):
-            # jar-scoped tokens cannot create new jars
             raise HTTPException(403, "admin password required to create via API (or use /api/jars)")
         try:
-            jar = store.create_jar(body.name, body.agents, body.meta, password=body.password)
+            jar = store.create_jar(
+                body.name, body.agents, body.meta, password=body.password, repos=body.repos
+            )
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         data = jar.public_dict()
@@ -205,6 +270,7 @@ def create_app(store: Store) -> FastAPI:
                 jar_name=jar.name,
                 password=jar.password,
                 agents=jar.agents,
+                repos=jar.repos,
             )["share_url"]
         return data
 
@@ -216,6 +282,8 @@ def create_app(store: Store) -> FastAPI:
     ) -> list[dict[str, Any]]:
         if auth.admin or auth.open_bus:
             jars = store.list_jars(agent, include_archived)
+        elif auth.agent_id:
+            jars = store.list_jars(auth.agent_id, include_archived)
         else:
             j = store.get_jar(auth.jar_id or "")
             jars = [j] if j and (not agent or agent in j.agents) else []
@@ -226,7 +294,7 @@ def create_app(store: Store) -> FastAPI:
         j = store.get_jar(jar)
         if not j:
             raise HTTPException(404, "jar not found")
-        require_jar_access(auth, j.id, j.name)
+        require_jar_access(auth, j)
         return j.public_dict()
 
     @app.post("/jars/{jar}/pause")
@@ -234,7 +302,7 @@ def create_app(store: Store) -> FastAPI:
         j = store.get_jar(jar)
         if not j:
             raise HTTPException(404, "jar not found")
-        require_jar_access(auth, j.id, j.name)
+        require_jar_access(auth, j)
         return store.set_jar_paused(jar, True).public_dict()
 
     @app.post("/jars/{jar}/resume")
@@ -242,7 +310,7 @@ def create_app(store: Store) -> FastAPI:
         j = store.get_jar(jar)
         if not j:
             raise HTTPException(404, "jar not found")
-        require_jar_access(auth, j.id, j.name)
+        require_jar_access(auth, j)
         return store.set_jar_paused(jar, False).public_dict()
 
     @app.get("/jars/{jar}/messes")
@@ -255,7 +323,7 @@ def create_app(store: Store) -> FastAPI:
         j = store.get_jar(jar)
         if not j:
             raise HTTPException(404, "jar not found")
-        require_jar_access(auth, j.id, j.name)
+        require_jar_access(auth, j)
         return [
             m.model_dump(by_alias=True)
             for m in store.list_messes(jar, after_seq=after_seq, limit=limit)
@@ -263,10 +331,15 @@ def create_app(store: Store) -> FastAPI:
 
     @app.post("/send")
     def send_rest(body: SendBody, auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
-        jar = store.get_jar(body.jar)
-        if not jar:
-            raise HTTPException(404, f"jar not found: {body.jar}")
-        require_jar_access(auth, jar.id, jar.name)
+        jar = pick_jar(
+            auth,
+            agent=body.from_agent,
+            jar=body.jar,
+            repo=body.repo,
+            workdir=body.workdir,
+        )
+        assert jar is not None
+        body.jar = jar.name
         return _send(store, body)
 
     @app.post("/ack")
@@ -274,7 +347,7 @@ def create_app(store: Store) -> FastAPI:
         j = store.get_jar(body.jar)
         if not j:
             raise HTTPException(404, f"jar not found: {body.jar}")
-        require_jar_access(auth, j.id, j.name)
+        require_jar_access(auth, j)
         try:
             store.advance_cursor(j.id, body.agent, body.seq)
         except KeyError as e:
@@ -285,10 +358,10 @@ def create_app(store: Store) -> FastAPI:
     def update_local(
         body: LocalStateBody, auth: AuthContext = Depends(resolve_auth)
     ) -> dict[str, Any]:
-        j = store.get_jar(body.jar)
-        if not j:
-            raise HTTPException(404, "jar not found")
-        require_jar_access(auth, j.id, j.name)
+        j = pick_jar(
+            auth, agent=body.agent, jar=body.jar, repo=body.repo, workdir=body.workdir
+        )
+        assert j is not None
         cur = j.local.get(body.agent) or AgentLocalState(agent_id=body.agent)
         if body.workdir is not None:
             cur.workdir = body.workdir
@@ -303,18 +376,32 @@ def create_app(store: Store) -> FastAPI:
         except KeyError as e:
             raise HTTPException(400, str(e)) from e
 
-    @app.get("/mcp")
-    @app.get("/mcp/tools")
-    def mcp_tools(auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
-        _ = auth
+    def _mcp_tool_list() -> dict[str, Any]:
         return {
             "name": "messjar",
             "version": "0.1.0",
-            "description": "Mess&Jar peer agent bus",
+            "description": (
+                "Mess&Jar peer agent bus. One MCP connection; pass workdir or repo "
+                "and the bus picks the jar for the project you're in."
+            ),
             "tools": [
                 {
+                    "name": "which_jar",
+                    "description": "Resolve which jar matches this agent + workdir/repo",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent": {"type": "string"},
+                            "jar": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "workdir": {"type": "string"},
+                        },
+                        "required": ["agent"],
+                    },
+                },
+                {
                     "name": "send",
-                    "description": "Post a Mess into a Jar",
+                    "description": "Post a Mess (jar optional if workdir/repo bound)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -326,18 +413,22 @@ def create_app(store: Store) -> FastAPI:
                             "reply_expected": {"type": "boolean"},
                             "hop": {"type": "integer"},
                             "refs": {"type": "array", "items": {"type": "string"}},
+                            "repo": {"type": "string"},
+                            "workdir": {"type": "string"},
                         },
-                        "required": ["jar", "from", "to", "body", "kind"],
+                        "required": ["from", "to", "body", "kind"],
                     },
                 },
                 {
                     "name": "check_jar",
-                    "description": "Non-blocking: new messes for this agent",
+                    "description": "New messes for this agent (scoped by jar or workdir/repo)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "agent": {"type": "string"},
                             "jar": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "workdir": {"type": "string"},
                             "after_seq": {"type": "integer"},
                             "limit": {"type": "integer"},
                             "ack": {"type": "boolean"},
@@ -347,12 +438,14 @@ def create_app(store: Store) -> FastAPI:
                 },
                 {
                     "name": "wait",
-                    "description": "Block until a matching Mess arrives or timeout",
+                    "description": "Block until a Mess arrives",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "agent": {"type": "string"},
                             "jar": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "workdir": {"type": "string"},
                             "after_seq": {"type": "integer"},
                             "timeout_s": {"type": "number"},
                         },
@@ -373,6 +466,12 @@ def create_app(store: Store) -> FastAPI:
             ],
         }
 
+    @app.get("/mcp")
+    @app.get("/mcp/tools")
+    def mcp_tools(auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
+        _ = auth
+        return _mcp_tool_list()
+
     @app.post("/mcp/call")
     def mcp_call(
         payload: dict[str, Any], auth: AuthContext = Depends(resolve_auth)
@@ -380,31 +479,83 @@ def create_app(store: Store) -> FastAPI:
         name = payload.get("name")
         args = payload.get("arguments") or {}
         try:
+            if name == "which_jar":
+                body = WhichJarBody.model_validate(args)
+                jar = pick_jar(
+                    auth,
+                    agent=body.agent,
+                    jar=body.jar,
+                    repo=body.repo,
+                    workdir=body.workdir,
+                )
+                assert jar is not None
+                return {
+                    "content": [
+                        {
+                            "type": "json",
+                            "json": {
+                                "jar": jar.name,
+                                "id": jar.id,
+                                "repos": jar.repos,
+                                "agents": jar.agents,
+                            },
+                        }
+                    ]
+                }
             if name == "send":
                 body = SendBody.model_validate(args)
-                jar = store.get_jar(body.jar)
-                if not jar:
-                    raise HTTPException(404, f"jar not found: {body.jar}")
-                require_jar_access(auth, jar.id, jar.name)
+                jar = pick_jar(
+                    auth,
+                    agent=body.from_agent,
+                    jar=body.jar,
+                    repo=body.repo,
+                    workdir=body.workdir,
+                )
+                assert jar is not None
+                body.jar = jar.name
                 return {"content": [{"type": "json", "json": _send(store, body)}]}
             if name == "check_jar":
                 body = CheckBody.model_validate(args)
                 jar_filter = body.jar
-                if not auth.admin and not auth.open_bus:
+                if body.repo or body.workdir or (not jar_filter and auth.jar_name):
+                    jar = pick_jar(
+                        auth,
+                        agent=body.agent,
+                        jar=body.jar,
+                        repo=body.repo,
+                        workdir=body.workdir,
+                        required=bool(body.repo or body.workdir or auth.jar_name),
+                    )
+                    if jar:
+                        jar_filter = jar.name
+                if auth.agent_id and not jar_filter:
+                    # all jars for this agent
+                    jar_filter = None
+                elif auth.jar_name and not jar_filter:
                     jar_filter = auth.jar_name
                 batch = store.check_jar(
                     body.agent, jar_filter, after_seq=body.after_seq, limit=body.limit
                 )
                 if body.ack:
                     for item in batch:
-                        require_jar_access(auth, item["jar"]["id"], item["jar"]["name"])
+                        j = store.get_jar(item["jar"]["id"])
+                        if j:
+                            require_jar_access(auth, j)
                         store.advance_cursor(item["jar"]["id"], body.agent, item["cursor"])
                 return {"content": [{"type": "json", "json": batch}]}
             if name == "wait":
                 body = WaitBody.model_validate(args)
                 jar_filter = body.jar
-                if not auth.admin and not auth.open_bus:
-                    jar_filter = auth.jar_name
+                if body.repo or body.workdir or auth.jar_name:
+                    jar = pick_jar(
+                        auth,
+                        agent=body.agent,
+                        jar=body.jar,
+                        repo=body.repo,
+                        workdir=body.workdir,
+                    )
+                    if jar:
+                        jar_filter = jar.name
                 batch = store.wait(
                     body.agent,
                     jar_id_or_name=jar_filter,
@@ -412,13 +563,18 @@ def create_app(store: Store) -> FastAPI:
                     timeout_s=body.timeout_s,
                 )
                 for item in batch:
-                    require_jar_access(auth, item["jar"]["id"], item["jar"]["name"])
+                    j = store.get_jar(item["jar"]["id"])
+                    if j:
+                        require_jar_access(auth, j)
                     store.advance_cursor(item["jar"]["id"], body.agent, item["cursor"])
                 return {"content": [{"type": "json", "json": batch}]}
             if name == "list_jars":
                 body = ListJarsBody.model_validate(args)
+                agent = body.agent or auth.agent_id
                 if auth.admin or auth.open_bus:
-                    jars = store.list_jars(body.agent, body.include_archived)
+                    jars = store.list_jars(agent, body.include_archived)
+                elif auth.agent_id:
+                    jars = store.list_jars(auth.agent_id, body.include_archived)
                 else:
                     j = store.get_jar(auth.jar_id or "")
                     jars = [j] if j else []
@@ -444,7 +600,7 @@ def create_app(store: Store) -> FastAPI:
 
 
 def _send(store: Store, body: SendBody) -> dict[str, Any]:
-    jar = store.get_jar(body.jar)
+    jar = store.get_jar(body.jar or "")
     if not jar:
         raise HTTPException(404, f"jar not found: {body.jar}")
     try:
@@ -470,20 +626,13 @@ def run_server(
 ) -> None:
     import uvicorn
 
-    url = database_url or os.environ.get("DATABASE_URL") or os.environ.get(
-        "DATABASE_PRIVATE_URL"
-    )
+    url = database_url or os.environ.get("DATABASE_URL")
     if not url:
-        raise SystemExit(
-            "DATABASE_URL is missing.\n"
-            "On Railway: Project → + New → Database → Add PostgreSQL, then on this "
-            "service Variables → Variable Reference → Postgres → DATABASE_URL.\n"
-            "Redeploy after the variable is set."
-        )
+        raise SystemExit("DATABASE_URL is required (PostgreSQL connection string)")
 
     store = Store(normalize_database_url(url))
     app = create_app(store)
     label = database_host_label(url)
-    auth_state = "admin+jar" if configured_password() else "jar-passwords"
+    auth_state = "admin+agent+jar" if configured_password() else "agent+jar"
     print(f"Mess&Jar bus postgres={label} auth={auth_state} http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")

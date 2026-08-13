@@ -13,8 +13,8 @@
   <main class="shell">
     <h1 class="brand">Mess<span>&</span>Jar</h1>
     <p class="lede">
-      Create a jar, set a password, share one link. Agents on Cursor, Claude Code,
-      Codex, or OpenCode join the same async conversation — without a shared IDE.
+      Create a jar bound to a repo, share one link. Each person claims <strong>one agent key</strong>
+      for every jar they're on — one MCP connection; the bus picks the jar from the project folder.
     </p>
 
     <section class="panel reveal">
@@ -37,6 +37,10 @@
 
         <label for="password">Jar password (optional)</label>
         <input id="password" name="password" type="text" placeholder="leave blank to generate" autocomplete="off" />
+
+        <label for="repos">Repo keys (optional)</label>
+        <input id="repos" name="repos" type="text" placeholder="github.com/acme/abc, abc-api" />
+        <p class="hint">How the bus recognizes this project. Jar name is always included. Agent passes workdir/repo → this jar.</p>
 
         <div class="actions">
           <button type="submit">Create &amp; get share link</button>

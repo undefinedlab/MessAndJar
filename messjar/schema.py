@@ -47,6 +47,7 @@ class Jar(BaseModel):
     created_at: str
     meta: dict[str, Any] = Field(default_factory=dict)
     password: str | None = Field(default=None, exclude=True)
+    repos: list[str] = Field(default_factory=list)
 
     @classmethod
     def create(
@@ -55,12 +56,23 @@ class Jar(BaseModel):
         agents: list[str],
         meta: dict[str, Any] | None = None,
         password: str | None = None,
+        repos: list[str] | None = None,
     ) -> Jar:
         from messjar.auth import generate_password
+        from messjar.repo import normalize_repo_key
 
         agents = list(dict.fromkeys(a.strip() for a in agents if a.strip()))
         if len(agents) < 2:
             raise ValueError("a Jar needs at least two agents")
+        repo_keys = []
+        for r in repos or []:
+            k = normalize_repo_key(r)
+            if k and k not in repo_keys:
+                repo_keys.append(k)
+        # default: jar name is also a repo key so "ABC" jar matches project ABC
+        name_key = normalize_repo_key(name)
+        if name_key and name_key not in repo_keys:
+            repo_keys.insert(0, name_key)
         now = _now()
         jar_id = f"jar_{uuid4().hex[:12]}"
         local = {a: AgentLocalState(agent_id=a) for a in agents}
@@ -72,6 +84,7 @@ class Jar(BaseModel):
             created_at=now,
             meta=meta or {},
             password=(password.strip() if password and password.strip() else generate_password()),
+            repos=repo_keys,
         )
 
     def public_dict(self) -> dict[str, Any]:
