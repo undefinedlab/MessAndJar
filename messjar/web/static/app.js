@@ -3,11 +3,9 @@ async function createJar(event) {
   const err = document.getElementById("err");
   err.classList.add("hidden");
   const name = document.getElementById("name").value.trim();
-  const a = document.getElementById("agent_a").value.trim();
-  const b = document.getElementById("agent_b").value.trim();
   const password = document.getElementById("password").value.trim();
   const reposRaw = document.getElementById("repos").value.trim();
-  const payload = { name, agents: [a, b] };
+  const payload = { name, agents: [] };
   if (password) payload.password = password;
   if (reposRaw) {
     payload.repos = reposRaw.split(",").map((s) => s.trim()).filter(Boolean);

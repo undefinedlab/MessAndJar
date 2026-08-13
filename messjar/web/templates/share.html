@@ -12,12 +12,12 @@
 <body>
   <main class="shell">
     <h1 class="brand">Mess<span>&</span>Jar</h1>
-    <p class="lede">You're invited to jar <strong>{{ jar }}</strong>. Claim one agent key for <em>all</em> your jars — MCP picks the jar from the repo you're in.</p>
+    <p class="lede">Join jar <strong>{{ jar }}</strong>. Pick the tool you actually use — your agent id is created for you.</p>
 
     {% if error %}
     <section class="panel">
       <p class="error">{{ error }}</p>
-      <p class="hint">Open the full share link (it includes <code>?p=</code>), or ask the creator for the jar password.</p>
+      <p class="hint">Open the full share link (it includes <code>?p=</code>).</p>
     </section>
     {% else %}
     <section class="panel reveal">
@@ -25,65 +25,56 @@
         <div>Bus <strong>{{ bus_url }}</strong></div>
         <div>Jar <strong>{{ jar }}</strong></div>
         <div>Repos keys <strong>{{ repos | join(', ') }}</strong></div>
-        <div>Password <strong>{{ password }}</strong></div>
-        <div>Agents <strong>{{ agents | join(', ') }}</strong></div>
+        {% if agents %}
+        <div>Already joined <strong>{{ agents | join(', ') }}</strong></div>
+        {% endif %}
       </div>
 
-      <h2>One MCP for every jar</h2>
-      <p class="hint">Pick your agent id on this jar, claim a durable key once. Reuse it when you join more jars later.</p>
-      <label for="claim-agent">Your agent id</label>
-      <select id="claim-agent">
-        {% for a in agents %}
-        <option value="{{ a }}">{{ a }}</option>
-        {% endfor %}
-      </select>
-      <div class="actions">
-        <button type="button" id="claim-btn">Claim my agent key</button>
+      <h2>Join</h2>
+      <label for="display-name">Display name (optional)</label>
+      <input id="display-name" type="text" placeholder="alex" autocomplete="nickname" />
+      <p class="hint">Becomes part of your id, e.g. <code>alex@cursor</code>. Leave blank for a random handle.</p>
+
+      <label>Your tool</label>
+      <div class="tabs" id="tool-tabs">
+        <button type="button" class="tab active" data-tool="cursor">Cursor</button>
+        <button type="button" class="tab" data-tool="claude">Claude Code</button>
+        <button type="button" class="tab" data-tool="codex">Codex</button>
+        <button type="button" class="tab" data-tool="opencode">OpenCode</button>
       </div>
-      <p id="claim-err" class="error hidden"></p>
-      <div id="claim-result" class="hidden" style="margin-top:1rem">
+
+      <div class="actions">
+        <button type="button" id="join-btn">Join &amp; get my MCP key</button>
+      </div>
+      <p id="join-err" class="error hidden"></p>
+
+      <div id="join-result" class="hidden" style="margin-top:1.25rem">
         <div class="meta">
+          <div>Your agent id <strong id="out-agent"></strong></div>
           <div>Agent key <strong id="out-token"></strong></div>
         </div>
         <p class="hint" id="out-hint"></p>
         <div class="mono" id="agent-mcp-block"></div>
-        <button type="button" class="secondary" data-copy-target="agent-mcp-block">Copy MCP JSON</button>
+        <div class="actions">
+          <button type="button" class="secondary" data-copy-target="agent-mcp-block">Copy MCP JSON</button>
+        </div>
+        <h2 style="margin-top:1.2rem">Daemon</h2>
+        <div class="mono" id="daemon-block"></div>
+        <button type="button" class="secondary" data-copy-target="daemon-block">Copy daemon command</button>
       </div>
     </section>
-
-    <section class="panel reveal" style="margin-top:1rem">
-      <h2>Jar-only MCP (optional)</h2>
-      <p class="hint">Scoped to this jar only — prefer the agent key above if you juggle multiple projects.</p>
-      <div class="mono" id="mcp-block">{{ mcp_json_text }}</div>
-      <button type="button" class="secondary" data-copy-target="mcp-block">Copy jar MCP JSON</button>
-
-      <h2 style="margin-top:1.4rem">Daemon</h2>
-      <div class="tabs" id="daemon-tabs">
-        <button type="button" class="tab active" data-tool="cursor">Cursor</button>
-        <button type="button" class="tab" data-tool="claude_code">Claude Code</button>
-        <button type="button" class="tab" data-tool="codex">Codex</button>
-        <button type="button" class="tab" data-tool="opencode">OpenCode</button>
-      </div>
-      <div class="mono" id="daemon-block">{{ daemon.cursor }}</div>
-      <button type="button" class="secondary" data-copy-target="daemon-block">Copy command</button>
-    </section>
-    <script type="application/json" id="daemon-json">{{ daemon | tojson }}</script>
-    <script type="application/json" id="claim-meta">{{ {"jar": jar, "password": password} | tojson }}</script>
+    <script type="application/json" id="join-meta">{{ {"jar": jar, "password": password} | tojson }}</script>
     {% endif %}
 
     <p class="foot"><a href="/">Create another jar</a></p>
   </main>
   <script>
-    const daemonMap = (() => {
-      const el = document.getElementById('daemon-json');
-      return el ? JSON.parse(el.textContent) : {};
-    })();
-    const block = document.getElementById('daemon-block');
-    document.querySelectorAll('#daemon-tabs .tab').forEach((tab) => {
+    let selectedTool = 'cursor';
+    document.querySelectorAll('#tool-tabs .tab').forEach((tab) => {
       tab.addEventListener('click', () => {
-        document.querySelectorAll('#daemon-tabs .tab').forEach((t) => t.classList.remove('active'));
+        document.querySelectorAll('#tool-tabs .tab').forEach((t) => t.classList.remove('active'));
         tab.classList.add('active');
-        if (block) block.textContent = daemonMap[tab.dataset.tool] || '';
+        selectedTool = tab.dataset.tool;
       });
     });
     document.querySelectorAll('[data-copy-target]').forEach((btn) => {
@@ -95,28 +86,32 @@
         setTimeout(() => { btn.textContent = old; }, 900);
       });
     });
-    const claimBtn = document.getElementById('claim-btn');
-    if (claimBtn) {
-      const meta = JSON.parse(document.getElementById('claim-meta').textContent);
-      claimBtn.addEventListener('click', async () => {
-        const err = document.getElementById('claim-err');
+    const joinBtn = document.getElementById('join-btn');
+    if (joinBtn) {
+      const meta = JSON.parse(document.getElementById('join-meta').textContent);
+      joinBtn.addEventListener('click', async () => {
+        const err = document.getElementById('join-err');
         err.classList.add('hidden');
         try {
-          const res = await fetch('/api/agent-key', {
+          const res = await fetch('/api/join', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              agent_id: document.getElementById('claim-agent').value,
               jar: meta.jar,
               password: meta.password,
+              tool: selectedTool,
+              display_name: document.getElementById('display-name').value.trim() || null,
             }),
           });
           const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || 'claim failed');
-          document.getElementById('claim-result').classList.remove('hidden');
+          if (!res.ok) throw new Error(data.detail || 'join failed');
+          document.getElementById('join-result').classList.remove('hidden');
+          document.getElementById('out-agent').textContent = data.agent_id;
           document.getElementById('out-token').textContent = data.token;
           document.getElementById('out-hint').textContent = data.hint || '';
           document.getElementById('agent-mcp-block').textContent = data.mcp_json_text;
+          const daemon = (data.daemon && (data.daemon[selectedTool] || data.daemon.claude_code || data.daemon.cursor)) || '';
+          document.getElementById('daemon-block').textContent = daemon;
         } catch (e) {
           err.textContent = e.message || String(e);
           err.classList.remove('hidden');

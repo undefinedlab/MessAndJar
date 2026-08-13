@@ -58,13 +58,15 @@ def bus_serve(
 @jars_app.command("create")
 def jars_create(
     name: str = typer.Argument(..., help="Jar name"),
-    agents: str = typer.Option(..., "--agents", help="Comma-separated agent ids"),
+    agents: Optional[str] = typer.Option(
+        None, "--agents", help="Optional pre-seeded agent ids (usually join via share link)"
+    ),
     bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
     password: Optional[str] = typer.Option(
         None, "--password", "-p", envvar="MESSJAR_PASSWORD"
     ),
 ) -> None:
-    agent_list = [a.strip() for a in agents.split(",") if a.strip()]
+    agent_list = [a.strip() for a in (agents or "").split(",") if a.strip()]
     with _client(bus, password) as c:
         jar = c.create_jar(name, agent_list)
     console.print(f"created [cyan]{jar['name']}[/] id={jar['id']} agents={jar['agents']}")

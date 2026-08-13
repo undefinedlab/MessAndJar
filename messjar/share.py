@@ -46,6 +46,10 @@ def agent_mcp_bundle(*, base_url: str, agent_id: str, token: str) -> dict[str, A
                 f"mj daemon run --agent {agent_id} --adapter cursor "
                 f"--bus {base} --password '{token}' --workdir ."
             ),
+            "claude": (
+                f"mj daemon run --agent {agent_id} --adapter claude_code "
+                f"--bus {base} --password '{token}' --workdir ."
+            ),
             "claude_code": (
                 f"mj daemon run --agent {agent_id} --adapter claude_code "
                 f"--bus {base} --password '{token}' --workdir ."

@@ -29,16 +29,17 @@ TEMPLATE_DIR = WEB_DIR / "templates"
 
 class CreateJarBody(BaseModel):
     name: str
-    agents: list[str]
+    agents: list[str] = Field(default_factory=list)
     password: str | None = None
     repos: list[str] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
-class ClaimKeyBody(BaseModel):
-    agent_id: str
+class JoinBody(BaseModel):
     jar: str
     password: str
+    tool: str  # cursor | claude | codex | opencode
+    display_name: str | None = None
 
 
 class SendBody(BaseModel):
@@ -234,18 +235,31 @@ def create_app(store: Store) -> FastAPI:
         }
 
     @app.post("/api/agent-key")
-    def claim_agent_key(request: Request, body: ClaimKeyBody) -> dict[str, Any]:
-        """Prove jar membership → durable agent key for one MCP across all your jars."""
+    @app.post("/api/join")
+    def join_jar(request: Request, body: JoinBody) -> dict[str, Any]:
+        """Join with tool + optional name → auto agent id, attach to jar, return MCP key."""
+        from messjar.agents import make_agent_id, normalize_tool
+
         jar = store.get_jar(body.jar)
         if not jar or not jar.password or not passwords_match(body.password, jar.password):
             raise HTTPException(401, "bad jar password")
-        if body.agent_id not in jar.agents:
-            raise HTTPException(403, f"{body.agent_id} is not a participant on {jar.name}")
-        agent_id, token = store.upsert_agent_key(body.agent_id)
+        try:
+            tool = normalize_tool(body.tool)
+            agent_id = make_agent_id(body.display_name, tool)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+        jar = store.attach_agent(jar.id, agent_id)
+        _, token = store.upsert_agent_key(agent_id)
         return {
             "agent_id": agent_id,
+            "tool": tool,
+            "jar": jar.name,
+            "agents": jar.agents,
             "token": token,
-            **agent_mcp_bundle(base_url=_request_base(request), agent_id=agent_id, token=token),
+            **agent_mcp_bundle(
+                base_url=_request_base(request), agent_id=agent_id, token=token
+            ),
         }
 
     @app.post("/jars")

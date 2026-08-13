@@ -13,8 +13,8 @@
   <main class="shell">
     <h1 class="brand">Mess<span>&</span>Jar</h1>
     <p class="lede">
-      Create a jar bound to a repo, share one link. Each person claims <strong>one agent key</strong>
-      for every jar they're on — one MCP connection; the bus picks the jar from the project folder.
+      Create a jar, share one link. People join with whatever tool they use —
+      Cursor, Claude Code, Codex, or OpenCode — agent ids are assigned on join.
     </p>
 
     <section class="panel reveal">
@@ -23,24 +23,12 @@
         <label for="name">Jar name</label>
         <input id="name" name="name" required placeholder="collab-auth" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,62}" />
 
-        <div class="row">
-          <div>
-            <label for="agent_a">Your agent id</label>
-            <input id="agent_a" name="agent_a" required placeholder="alice@cursor" />
-          </div>
-          <div>
-            <label for="agent_b">Their agent id</label>
-            <input id="agent_b" name="agent_b" required placeholder="bob@claude" />
-          </div>
-        </div>
-        <p class="hint">Use tool suffixes: @cursor, @claude, @codex, @opencode</p>
+        <label for="repos">Repo keys (optional)</label>
+        <input id="repos" name="repos" type="text" placeholder="github.com/acme/abc, abc-api" />
+        <p class="hint">How the bus maps this project. Jar name is always included.</p>
 
         <label for="password">Jar password (optional)</label>
         <input id="password" name="password" type="text" placeholder="leave blank to generate" autocomplete="off" />
-
-        <label for="repos">Repo keys (optional)</label>
-        <input id="repos" name="repos" type="text" placeholder="github.com/acme/abc, abc-api" />
-        <p class="hint">How the bus recognizes this project. Jar name is always included. Agent passes workdir/repo → this jar.</p>
 
         <div class="actions">
           <button type="submit">Create &amp; get share link</button>
@@ -61,6 +49,7 @@
         <button type="button" class="secondary" id="copy-link">Copy link</button>
         <a class="btn" id="open-link" href="#">Open join page</a>
       </div>
+      <p class="hint">Send the link to anyone. They pick their tool on the join page — you don’t need to know Cursor vs Claude up front.</p>
     </section>
 
     <p class="foot">Same Railway service hosts the bus, MCP endpoints, and this UI.</p>

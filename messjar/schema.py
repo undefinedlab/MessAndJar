@@ -61,9 +61,8 @@ class Jar(BaseModel):
         from messjar.auth import generate_password
         from messjar.repo import normalize_repo_key
 
-        agents = list(dict.fromkeys(a.strip() for a in agents if a.strip()))
-        if len(agents) < 2:
-            raise ValueError("a Jar needs at least two agents")
+        agents = list(dict.fromkeys(a.strip() for a in (agents or []) if a.strip()))
+        # Agents join via the share link — creator does not pre-assign tools.
         repo_keys = []
         for r in repos or []:
             k = normalize_repo_key(r)

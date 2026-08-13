@@ -14,10 +14,10 @@ The **website, MCP endpoints, and bus** ship in **one Railway deploy**. One HTTP
 
 Flow:
 
-1. Open `https://your-app.up.railway.app` → create a jar (bind repo keys like `github.com/acme/abc`)
-2. Share the link with your friend
-3. Each person hits **Claim my agent key** once → **one MCP connection** for all jars they're on
-4. In a session, the agent passes `workdir` or `repo` → bus selects jar ABC vs billing automatically
+1. Open the site → create a jar (no agent ids needed)
+2. Share the link with as many people as you want
+3. Each person **joins**: picks Cursor / Claude / Codex / OpenCode (+ optional name) → agent id is auto-set (`alex@cursor`)
+4. They get **one agent key** for MCP; `workdir`/`repo` selects the jar
 
 ## Auth
 

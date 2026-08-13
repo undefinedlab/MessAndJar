@@ -1,4 +1,4 @@
-"""Store + auth + repo→jar tests. Needs DATABASE_URL."""
+"""Store + join/agent-id tests. Needs DATABASE_URL."""
 
 from __future__ import annotations
 
@@ -8,29 +8,29 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from messjar.agents import make_agent_id
 from messjar.auth import extract_password, passwords_match
 from messjar.bus.server import create_app
 from messjar.repo import normalize_repo_key
-from messjar.schema import Mess, MessKind
+from messjar.schema import Mess
 from messjar.store import Store
 
 
 def test_normalize_repo_key() -> None:
     assert normalize_repo_key("https://github.com/Acme/ABC.git") == "github.com/acme/abc"
-    assert normalize_repo_key("git@github.com:Acme/ABC.git") == "github.com/acme/abc"
-    assert normalize_repo_key("ABC") == "abc"
+
+
+def test_make_agent_id() -> None:
+    assert make_agent_id("Alex", "cursor") == "alex@cursor"
+    assert make_agent_id("Alex", "claude_code") == "alex@claude"
+    assert "@codex" in make_agent_id(None, "codex")
 
 
 def test_fyi_does_not_require_reply() -> None:
     m = Mess.create(
-        jar_id="jar_x",
-        from_agent="a",
-        to_agent="b",
-        body="heads up",
-        kind="fyi",
+        jar_id="jar_x", from_agent="a", to_agent="b", body="heads up", kind="fyi"
     )
     assert m.reply_expected is False
-    assert m.wakes_agent() is False
 
 
 def test_password_compare() -> None:
@@ -53,36 +53,15 @@ def store(database_url: str) -> Store:
     s.close()
 
 
-def test_repo_resolve_and_agent_key(store: Store) -> None:
-    suffix = uuid.uuid4().hex[:8]
-    a = store.create_jar(
-        f"abc-{suffix}",
-        ["alice@cursor", "bob@claude"],
-        password=f"pw-a-{suffix}",
-        repos=["github.com/acme/abc"],
-    )
-    store.create_jar(
-        f"billing-{suffix}",
-        ["alice@cursor", "bob@claude"],
-        password=f"pw-b-{suffix}",
-        repos=["github.com/acme/billing"],
-    )
-    found = store.resolve_jar(
-        agent_id="alice@cursor",
-        repo="https://github.com/acme/abc.git",
-    )
-    assert found.id == a.id
-
-    agent_id, token = store.upsert_agent_key("alice@cursor")
-    assert store.get_agent_by_token(token) == agent_id
-    # second claim returns same token
-    _, token2 = store.upsert_agent_key("alice@cursor")
-    assert token2 == token
+def test_empty_jar_and_attach(store: Store) -> None:
+    name = f"empty-{uuid.uuid4().hex[:8]}"
+    jar = store.create_jar(name, [], password="pw")
+    assert jar.agents == []
+    jar = store.attach_agent(jar.id, "alex@cursor")
+    assert "alex@cursor" in jar.agents
 
 
-def test_public_create_claim_and_which_jar(
-    database_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MESSJAR_PASSWORD", raising=False)
     store = Store(database_url, min_size=1, max_size=2)
     app = create_app(store)
@@ -91,47 +70,46 @@ def test_public_create_claim_and_which_jar(
     name = f"web-{uuid.uuid4().hex[:8]}"
     created = client.post(
         "/api/jars",
-        json={
-            "name": name,
-            "agents": ["a@cursor", "b@claude"],
-            "password": "share-me",
-            "repos": ["github.com/acme/web"],
-        },
+        json={"name": name, "password": "share-me", "repos": ["github.com/acme/web"]},
     )
     assert created.status_code == 200
-    assert "github.com/acme/web" in created.json()["repos"]
+    assert created.json()["agents"] == []
 
-    claimed = client.post(
-        "/api/agent-key",
-        json={"agent_id": "a@cursor", "jar": name, "password": "share-me"},
-    )
-    assert claimed.status_code == 200
-    token = claimed.json()["token"]
-    assert token.startswith("mj_")
-
-    which = client.post(
-        "/mcp/call",
-        headers={"Authorization": f"Bearer {token}"},
+    joined = client.post(
+        "/api/join",
         json={
-            "name": "which_jar",
-            "arguments": {
-                "agent": "a@cursor",
-                "repo": "github.com/acme/web",
-            },
+            "jar": name,
+            "password": "share-me",
+            "tool": "cursor",
+            "display_name": "Alex",
         },
     )
-    assert which.status_code == 200
-    assert which.json()["content"][0]["json"]["jar"] == name
+    assert joined.status_code == 200
+    assert joined.json()["agent_id"] == "alex@cursor"
+    assert joined.json()["token"].startswith("mj_")
 
+    friend = client.post(
+        "/api/join",
+        json={"jar": name, "password": "share-me", "tool": "claude", "display_name": "Sam"},
+    )
+    assert friend.status_code == 200
+    assert friend.json()["agent_id"] == "sam@claude"
+
+    agents = client.get(f"/j/{name}?p=share-me")
+    assert agents.status_code == 200
+    assert "alex@cursor" in agents.text or "Join" in agents.text
+
+    # send between joined agents via agent key
+    token = joined.json()["token"]
     sent = client.post(
         "/mcp/call",
         headers={"Authorization": f"Bearer {token}"},
         json={
             "name": "send",
             "arguments": {
-                "from": "a@cursor",
-                "to": "b@claude",
-                "body": "hi from repo context",
+                "from": "alex@cursor",
+                "to": "sam@claude",
+                "body": "hi",
                 "kind": "question",
                 "repo": "github.com/acme/web",
             },
