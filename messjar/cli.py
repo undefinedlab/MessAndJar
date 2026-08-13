@@ -29,37 +29,43 @@ app.add_typer(daemon_app, name="daemon")
 
 console = Console()
 DEFAULT_BUS = os.environ.get("MESSJAR_BUS", "http://127.0.0.1:7420")
-DEFAULT_DB = os.environ.get("MESSJAR_DB", str(Path.home() / ".messjar" / "bus.db"))
+DEFAULT_PASSWORD = os.environ.get("MESSJAR_PASSWORD") or os.environ.get("MESSJAR_TOKEN")
 
 
-def _client(bus: str) -> BusClient:
-    return BusClient(bus)
+def _client(bus: str, password: Optional[str] = None) -> BusClient:
+    return BusClient(bus, password=password if password is not None else DEFAULT_PASSWORD)
 
 
 @bus_app.command("serve")
 def bus_serve(
-    db: str = typer.Option(DEFAULT_DB, "--db", help="SQLite path"),
-    host: str = typer.Option(None, "--host", help="Bind host (default 0.0.0.0 in container)"),
+    database_url: Optional[str] = typer.Option(
+        None,
+        "--database-url",
+        envvar="DATABASE_URL",
+        help="PostgreSQL URL (required)",
+    ),
+    host: Optional[str] = typer.Option(None, "--host"),
     port: Optional[int] = typer.Option(None, "--port"),
 ) -> None:
-    """Start the HTTP/MCP bus."""
+    """Start the HTTP/MCP bus (Postgres + shared password)."""
     from messjar.bus.server import run_server
 
     bind_host = host or os.environ.get("HOST", "0.0.0.0")
     bind_port = port or int(os.environ.get("PORT", "7420"))
-    db_path = os.environ.get("MESSJAR_DB", db)
-    console.print(f"[bold]Mess&Jar bus[/] db={db_path} http://{bind_host}:{bind_port}")
-    run_server(db_path, host=bind_host, port=bind_port)
+    run_server(database_url, host=bind_host, port=bind_port)
 
 
 @jars_app.command("create")
 def jars_create(
     name: str = typer.Argument(..., help="Jar name"),
     agents: str = typer.Option(..., "--agents", help="Comma-separated agent ids"),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
     agent_list = [a.strip() for a in agents.split(",") if a.strip()]
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         jar = c.create_jar(name, agent_list)
     console.print(f"created [cyan]{jar['name']}[/] id={jar['id']} agents={jar['agents']}")
 
@@ -67,9 +73,12 @@ def jars_create(
 @jars_app.command("list")
 def jars_list(
     agent: Optional[str] = typer.Option(None, "--agent"),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         jars = c.list_jars(agent)
     table = Table(title="Jars")
     table.add_column("name")
@@ -86,7 +95,6 @@ def jars_list(
     console.print(table)
 
 
-# alias: mj jars → list
 @jars_app.callback(invoke_without_command=True)
 def jars_root(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
@@ -103,7 +111,10 @@ def send_mess(
     body_file: Optional[Path] = typer.Option(None, "--body-file"),
     hop: int = typer.Option(0, "--hop"),
     refs: Optional[str] = typer.Option(None, "--refs", help="Comma-separated refs"),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
     """Post a Mess into a Jar."""
     if body is None and body_file is None:
@@ -115,7 +126,7 @@ def send_mess(
         body = body_file.read_text()
     assert body is not None
     ref_list = [r.strip() for r in (refs or "").split(",") if r.strip()]
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         mess = c.send(
             jar,
             from_agent=from_agent,
@@ -134,10 +145,13 @@ def send_mess(
 def tail_jar(
     jar: str = typer.Argument(...),
     follow: bool = typer.Option(True, "--follow/--no-follow", "-f"),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
     """Watch Messes in a Jar."""
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         after = 0
         while True:
             messes = c.messes(jar, after_seq=after, limit=100)
@@ -158,9 +172,12 @@ def tail_jar(
 @app.command("pause")
 def pause_jar(
     jar: str = typer.Argument(...),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         j = c.pause(jar)
     console.print(f"paused [cyan]{j['name']}[/]")
 
@@ -168,9 +185,12 @@ def pause_jar(
 @app.command("resume")
 def resume_jar(
     jar: str = typer.Argument(...),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
 ) -> None:
-    with _client(bus) as c:
+    with _client(bus, password) as c:
         j = c.resume(jar)
     console.print(f"resumed [cyan]{j['name']}[/]")
 
@@ -181,7 +201,10 @@ def daemon_run(
     adapter: str = typer.Option(..., "--adapter", help="claude_code | cursor"),
     workdir: Path = typer.Option(Path.cwd(), "--workdir"),
     jar: Optional[str] = typer.Option(None, "--jar"),
-    bus: str = typer.Option(DEFAULT_BUS, "--bus"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     poll: float = typer.Option(2.0, "--poll"),
     max_hops: int = typer.Option(32, "--max-hops"),
@@ -203,6 +226,7 @@ def daemon_run(
         dry_run=dry_run,
         poll_s=poll,
         max_hops=max_hops,
+        password=password,
     )
     if once:
         n = d.poll_once()

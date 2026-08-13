@@ -1,45 +1,63 @@
-"""SQLite persistence for Jars and Messes."""
+"""PostgreSQL persistence for Jars and Messes."""
 
 from __future__ import annotations
 
 import json
-import sqlite3
-import threading
+import os
 import time
-from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from messjar.schema import AgentLocalState, Jar, Mess, MessKind
 
 
+def normalize_database_url(url: str) -> str:
+    """Railway sometimes gives postgres://; psycopg wants postgresql://."""
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://") :]
+    return url
+
+
 class Store:
-    def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        min_size: int = 1,
+        max_size: int = 10,
+    ) -> None:
+        raw = database_url or os.environ.get("DATABASE_URL")
+        if not raw:
+            raise ValueError("DATABASE_URL is required")
+        self.database_url = normalize_database_url(raw)
+        self._pool = ConnectionPool(
+            conninfo=self.database_url,
+            min_size=min_size,
+            max_size=max_size,
+            kwargs={"row_factory": dict_row},
+            open=True,
+        )
         self._migrate()
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self._pool.close()
 
     def _migrate(self) -> None:
-        with self._lock:
-            self._conn.executescript(
+        with self._pool.connection() as conn:
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jars (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,
-                    agents_json TEXT NOT NULL,
-                    local_json TEXT NOT NULL,
-                    paused INTEGER NOT NULL DEFAULT 0,
-                    archived INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL,
-                    meta_json TEXT NOT NULL DEFAULT '{}'
+                    agents_json JSONB NOT NULL,
+                    local_json JSONB NOT NULL,
+                    paused BOOLEAN NOT NULL DEFAULT FALSE,
+                    archived BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    meta_json JSONB NOT NULL DEFAULT '{}'::jsonb
                 );
 
                 CREATE TABLE IF NOT EXISTS messes (
@@ -50,55 +68,59 @@ class Store:
                     to_agent TEXT NOT NULL,
                     body TEXT NOT NULL,
                     kind TEXT NOT NULL,
-                    reply_expected INTEGER NOT NULL,
+                    reply_expected BOOLEAN NOT NULL,
                     hop INTEGER NOT NULL,
-                    refs_json TEXT NOT NULL,
-                    ts TEXT NOT NULL,
+                    refs_json JSONB NOT NULL,
+                    ts TIMESTAMPTZ NOT NULL,
                     schema_version INTEGER NOT NULL,
-                    UNIQUE(jar_id, seq)
+                    UNIQUE (jar_id, seq)
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_messes_jar_seq ON messes(jar_id, seq);
-                CREATE INDEX IF NOT EXISTS idx_messes_to ON messes(to_agent, jar_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_messes_jar_seq ON messes (jar_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_messes_to ON messes (to_agent, jar_id, seq);
                 """
             )
-            self._conn.commit()
-
-    # --- jars ---
+            conn.commit()
 
     def create_jar(self, name: str, agents: list[str], meta: dict[str, Any] | None = None) -> Jar:
         jar = Jar.create(name=name, agents=agents, meta=meta)
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO jars (id, name, agents_json, local_json, paused, archived, created_at, meta_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    jar.id,
-                    jar.name,
-                    json.dumps(jar.agents),
-                    json.dumps({k: v.model_dump() for k, v in jar.local.items()}),
-                    int(jar.paused),
-                    int(jar.archived),
-                    jar.created_at,
-                    json.dumps(jar.meta),
-                ),
-            )
-            self._conn.commit()
+        with self._pool.connection() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO jars (id, name, agents_json, local_json, paused, archived, created_at, meta_json)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        jar.id,
+                        jar.name,
+                        json.dumps(jar.agents),
+                        json.dumps({k: v.model_dump() for k, v in jar.local.items()}),
+                        jar.paused,
+                        jar.archived,
+                        jar.created_at,
+                        json.dumps(jar.meta),
+                    ),
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                if "unique" in str(e).lower():
+                    raise ValueError(f"jar name already exists: {name}") from e
+                raise
         return jar
 
     def get_jar(self, jar_id_or_name: str) -> Jar | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM jars WHERE id = ? OR name = ?",
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM jars WHERE id = %s OR name = %s",
                 (jar_id_or_name, jar_id_or_name),
             ).fetchone()
         return self._row_to_jar(row) if row else None
 
     def list_jars(self, agent_id: str | None = None, include_archived: bool = False) -> list[Jar]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM jars ORDER BY created_at DESC").fetchall()
+        with self._pool.connection() as conn:
+            rows = conn.execute("SELECT * FROM jars ORDER BY created_at DESC").fetchall()
         jars = [self._row_to_jar(r) for r in rows]
         if not include_archived:
             jars = [j for j in jars if not j.archived]
@@ -110,12 +132,9 @@ class Store:
         jar = self.get_jar(jar_id_or_name)
         if not jar:
             raise KeyError(f"jar not found: {jar_id_or_name}")
-        with self._lock:
-            self._conn.execute(
-                "UPDATE jars SET paused = ? WHERE id = ?",
-                (int(paused), jar.id),
-            )
-            self._conn.commit()
+        with self._pool.connection() as conn:
+            conn.execute("UPDATE jars SET paused = %s WHERE id = %s", (paused, jar.id))
+            conn.commit()
         jar.paused = paused
         return jar
 
@@ -126,12 +145,12 @@ class Store:
         if state.agent_id not in jar.agents:
             raise KeyError(f"agent {state.agent_id} not on jar {jar_id}")
         jar.local[state.agent_id] = state
-        with self._lock:
-            self._conn.execute(
-                "UPDATE jars SET local_json = ? WHERE id = ?",
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE jars SET local_json = %s::jsonb WHERE id = %s",
                 (json.dumps({k: v.model_dump() for k, v in jar.local.items()}), jar.id),
             )
-            self._conn.commit()
+            conn.commit()
         return jar
 
     def attach_agent(self, jar_id_or_name: str, agent_id: str) -> Jar:
@@ -141,19 +160,21 @@ class Store:
         if agent_id not in jar.agents:
             jar.agents.append(agent_id)
             jar.local[agent_id] = AgentLocalState(agent_id=agent_id)
-            with self._lock:
-                self._conn.execute(
-                    "UPDATE jars SET agents_json = ?, local_json = ? WHERE id = ?",
+            with self._pool.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE jars
+                    SET agents_json = %s::jsonb, local_json = %s::jsonb
+                    WHERE id = %s
+                    """,
                     (
                         json.dumps(jar.agents),
                         json.dumps({k: v.model_dump() for k, v in jar.local.items()}),
                         jar.id,
                     ),
                 )
-                self._conn.commit()
+                conn.commit()
         return jar
-
-    # --- messes ---
 
     def send(self, mess: Mess) -> Mess:
         jar = self.get_jar(mess.jar_id)
@@ -164,44 +185,44 @@ class Store:
         if mess.from_agent not in jar.agents or mess.to_agent not in jar.agents:
             raise ValueError("from/to must be participants on the jar")
         mess.jar_id = jar.id
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS m FROM messes WHERE jar_id = ?",
-                (jar.id,),
-            ).fetchone()
-            seq = int(row["m"]) + 1
-            mess.seq = seq
-            self._conn.execute(
-                """
-                INSERT INTO messes (
-                    id, jar_id, seq, from_agent, to_agent, body, kind,
-                    reply_expected, hop, refs_json, ts, schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    mess.id,
-                    mess.jar_id,
-                    seq,
-                    mess.from_agent,
-                    mess.to_agent,
-                    mess.body,
-                    mess.kind.value,
-                    int(mess.reply_expected),
-                    mess.hop,
-                    json.dumps(mess.refs),
-                    mess.ts,
-                    mess.schema_version,
-                ),
-            )
-            # bump sender hop tracking lightly
-            sender = jar.local.get(mess.from_agent) or AgentLocalState(agent_id=mess.from_agent)
-            sender.hop = max(sender.hop, mess.hop)
-            jar.local[mess.from_agent] = sender
-            self._conn.execute(
-                "UPDATE jars SET local_json = ? WHERE id = ?",
-                (json.dumps({k: v.model_dump() for k, v in jar.local.items()}), jar.id),
-            )
-            self._conn.commit()
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                conn.execute("SELECT id FROM jars WHERE id = %s FOR UPDATE", (jar.id,))
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS m FROM messes WHERE jar_id = %s",
+                    (jar.id,),
+                ).fetchone()
+                seq = int(row["m"]) + 1
+                mess.seq = seq
+                conn.execute(
+                    """
+                    INSERT INTO messes (
+                        id, jar_id, seq, from_agent, to_agent, body, kind,
+                        reply_expected, hop, refs_json, ts, schema_version
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    """,
+                    (
+                        mess.id,
+                        mess.jar_id,
+                        seq,
+                        mess.from_agent,
+                        mess.to_agent,
+                        mess.body,
+                        mess.kind.value,
+                        mess.reply_expected,
+                        mess.hop,
+                        json.dumps(mess.refs),
+                        mess.ts,
+                        mess.schema_version,
+                    ),
+                )
+                sender = jar.local.get(mess.from_agent) or AgentLocalState(agent_id=mess.from_agent)
+                sender.hop = max(sender.hop, mess.hop)
+                jar.local[mess.from_agent] = sender
+                conn.execute(
+                    "UPDATE jars SET local_json = %s::jsonb WHERE id = %s",
+                    (json.dumps({k: v.model_dump() for k, v in jar.local.items()}), jar.id),
+                )
         return mess
 
     def list_messes(
@@ -215,15 +236,15 @@ class Store:
         jar = self.get_jar(jar_id_or_name)
         if not jar:
             raise KeyError(f"jar not found: {jar_id_or_name}")
-        q = "SELECT * FROM messes WHERE jar_id = ? AND seq > ?"
+        q = "SELECT * FROM messes WHERE jar_id = %s AND seq > %s"
         params: list[Any] = [jar.id, after_seq]
         if to_agent:
-            q += " AND to_agent = ?"
+            q += " AND to_agent = %s"
             params.append(to_agent)
-        q += " ORDER BY seq ASC LIMIT ?"
+        q += " ORDER BY seq ASC LIMIT %s"
         params.append(limit)
-        with self._lock:
-            rows = self._conn.execute(q, params).fetchall()
+        with self._pool.connection() as conn:
+            rows = conn.execute(q, params).fetchall()
         return [self._row_to_mess(r) for r in rows]
 
     def check_jar(
@@ -234,7 +255,6 @@ class Store:
         after_seq: int | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """Non-blocking: unread messes for agent, optionally scoped to one jar."""
         jars = [self.get_jar(jar_id_or_name)] if jar_id_or_name else self.list_jars(agent_id)
         jars = [j for j in jars if j and agent_id in j.agents and not j.archived]
         out: list[dict[str, Any]] = []
@@ -260,19 +280,17 @@ class Store:
         jar = self.get_jar(jar_id)
         if not jar:
             raise KeyError(f"jar not found: {jar_id}")
+        if agent_id not in jar.agents:
+            raise KeyError(f"agent {agent_id} not on jar")
         local = jar.local.get(agent_id) or AgentLocalState(agent_id=agent_id)
         local.cursor = max(local.cursor, seq)
-        if jar.local.get(agent_id) is None:
-            # agent might only be addressed; still allow cursor if participant
-            if agent_id not in jar.agents:
-                raise KeyError(f"agent {agent_id} not on jar")
         jar.local[agent_id] = local
-        with self._lock:
-            self._conn.execute(
-                "UPDATE jars SET local_json = ? WHERE id = ?",
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE jars SET local_json = %s::jsonb WHERE id = %s",
                 (json.dumps({k: v.model_dump() for k, v in jar.local.items()}), jar.id),
             )
-            self._conn.commit()
+            conn.commit()
 
     def wait(
         self,
@@ -292,23 +310,30 @@ class Store:
                 return []
             time.sleep(poll_s)
 
-    # --- helpers ---
+    def _as_json(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
 
-    def _row_to_jar(self, row: sqlite3.Row) -> Jar:
-        local_raw = json.loads(row["local_json"])
+    def _row_to_jar(self, row: dict[str, Any]) -> Jar:
+        local_raw = self._as_json(row["local_json"])
         local = {k: AgentLocalState.model_validate(v) for k, v in local_raw.items()}
+        created = row["created_at"]
+        created_at = created if isinstance(created, str) else created.strftime("%Y-%m-%dT%H:%M:%SZ")
         return Jar(
             id=row["id"],
             name=row["name"],
-            agents=json.loads(row["agents_json"]),
+            agents=list(self._as_json(row["agents_json"])),
             local=local,
             paused=bool(row["paused"]),
             archived=bool(row["archived"]),
-            created_at=row["created_at"],
-            meta=json.loads(row["meta_json"] or "{}"),
+            created_at=created_at,
+            meta=dict(self._as_json(row["meta_json"] or {})),
         )
 
-    def _row_to_mess(self, row: sqlite3.Row) -> Mess:
+    def _row_to_mess(self, row: dict[str, Any]) -> Mess:
+        ts = row["ts"]
+        ts_s = ts if isinstance(ts, str) else ts.strftime("%Y-%m-%dT%H:%M:%SZ")
         return Mess(
             id=row["id"],
             jar_id=row["jar_id"],
@@ -317,8 +342,16 @@ class Store:
             kind=MessKind(row["kind"]),
             reply_expected=bool(row["reply_expected"]),
             hop=row["hop"],
-            refs=json.loads(row["refs_json"]),
-            ts=row["ts"],
+            refs=list(self._as_json(row["refs_json"])),
+            ts=ts_s,
             schema_version=row["schema_version"],
             seq=row["seq"],
         )
+
+
+def database_host_label(url: str) -> str:
+    try:
+        p = urlparse(normalize_database_url(url))
+        return p.hostname or "postgres"
+    except Exception:
+        return "postgres"

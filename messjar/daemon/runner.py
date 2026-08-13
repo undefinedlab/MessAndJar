@@ -27,8 +27,9 @@ class Daemon:
         poll_s: float = 2.0,
         max_hops: int = 32,
         auto_reply: bool = True,
+        password: str | None = None,
     ) -> None:
-        self.bus = BusClient(bus_url)
+        self.bus = BusClient(bus_url, password=password)
         self.agent_id = agent_id
         self.adapter = get_adapter(adapter_name)
         self.workdir = str(Path(workdir).expanduser().resolve())

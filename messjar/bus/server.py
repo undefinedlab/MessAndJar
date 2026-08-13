@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+import os
+from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from messjar.schema import Mess, MessKind
-from messjar.store import Store
+from messjar.auth import configured_password, extract_password, passwords_match
+from messjar.schema import AgentLocalState, Mess, MessKind
+from messjar.store import Store, database_host_label, normalize_database_url
 
 
 class CreateJarBody(BaseModel):
@@ -36,7 +37,7 @@ class CheckBody(BaseModel):
     jar: str | None = None
     after_seq: int | None = None
     limit: int = 50
-    ack: bool = True  # advance cursor after delivery
+    ack: bool = True
 
 
 class WaitBody(BaseModel):
@@ -66,83 +67,91 @@ class LocalStateBody(BaseModel):
     paused: bool | None = None
 
 
+def require_auth(
+    authorization: str | None = Header(default=None),
+    x_messjar_password: str | None = Header(default=None, alias="X-MessJar-Password"),
+) -> None:
+    expected = configured_password()
+    if not expected:
+        # Local/dev convenience: no password configured → open bus.
+        return
+    provided = extract_password(authorization, x_messjar_password)
+    if not passwords_match(provided, expected):
+        raise HTTPException(status_code=401, detail="unauthorized: bad or missing password")
+
+
 def create_app(store: Store) -> FastAPI:
     app = FastAPI(title="Mess&Jar Bus", version="0.1.0")
     app.state.store = store
+    auth: Callable[..., Any] = require_auth
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "auth": "required" if configured_password() else "open"}
 
-    # --- human / CLI REST ---
-
-    @app.post("/jars")
+    @app.post("/jars", dependencies=[Depends(auth)])
     def create_jar(body: CreateJarBody) -> dict[str, Any]:
         try:
             jar = store.create_jar(body.name, body.agents, body.meta)
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
-        except Exception as e:
-            if "UNIQUE" in str(e):
-                raise HTTPException(409, f"jar name already exists: {body.name}") from e
-            raise
         return jar.model_dump(by_alias=True)
 
-    @app.get("/jars")
+    @app.get("/jars", dependencies=[Depends(auth)])
     def list_jars(agent: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         return [j.model_dump(by_alias=True) for j in store.list_jars(agent, include_archived)]
 
-    @app.get("/jars/{jar}")
+    @app.get("/jars/{jar}", dependencies=[Depends(auth)])
     def get_jar(jar: str) -> dict[str, Any]:
         j = store.get_jar(jar)
         if not j:
             raise HTTPException(404, "jar not found")
         return j.model_dump(by_alias=True)
 
-    @app.post("/jars/{jar}/pause")
+    @app.post("/jars/{jar}/pause", dependencies=[Depends(auth)])
     def pause_jar(jar: str) -> dict[str, Any]:
         try:
             return store.set_jar_paused(jar, True).model_dump(by_alias=True)
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
 
-    @app.post("/jars/{jar}/resume")
+    @app.post("/jars/{jar}/resume", dependencies=[Depends(auth)])
     def resume_jar(jar: str) -> dict[str, Any]:
         try:
             return store.set_jar_paused(jar, False).model_dump(by_alias=True)
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
 
-    @app.get("/jars/{jar}/messes")
+    @app.get("/jars/{jar}/messes", dependencies=[Depends(auth)])
     def jar_messes(jar: str, after_seq: int = 0, limit: int = 100) -> list[dict[str, Any]]:
         try:
-            return [m.model_dump(by_alias=True) for m in store.list_messes(jar, after_seq=after_seq, limit=limit)]
+            return [
+                m.model_dump(by_alias=True)
+                for m in store.list_messes(jar, after_seq=after_seq, limit=limit)
+            ]
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
 
-    @app.post("/send")
+    @app.post("/send", dependencies=[Depends(auth)])
     def send_rest(body: SendBody) -> dict[str, Any]:
         return _send(store, body)
 
-    @app.post("/ack")
+    @app.post("/ack", dependencies=[Depends(auth)])
     def ack(body: AckBody) -> dict[str, str]:
+        j = store.get_jar(body.jar)
+        if not j:
+            raise HTTPException(404, f"jar not found: {body.jar}")
         try:
-            store.advance_cursor(body.jar if body.jar.startswith("jar_") else _resolve_jar_id(store, body.jar), body.agent, body.seq)
-        except KeyError as e:
-            # try resolve name
-            j = store.get_jar(body.jar)
-            if not j:
-                raise HTTPException(404, str(e)) from e
             store.advance_cursor(j.id, body.agent, body.seq)
+        except KeyError as e:
+            raise HTTPException(400, str(e)) from e
         return {"status": "ok"}
 
-    @app.post("/local")
+    @app.post("/local", dependencies=[Depends(auth)])
     def update_local(body: LocalStateBody) -> dict[str, Any]:
         j = store.get_jar(body.jar)
         if not j:
             raise HTTPException(404, "jar not found")
-        from messjar.schema import AgentLocalState
-
         cur = j.local.get(body.agent) or AgentLocalState(agent_id=body.agent)
         if body.workdir is not None:
             cur.workdir = body.workdir
@@ -157,11 +166,13 @@ def create_app(store: Store) -> FastAPI:
         except KeyError as e:
             raise HTTPException(400, str(e)) from e
 
-    # --- MCP-shaped tools (JSON-RPC-ish HTTP) ---
-
-    @app.get("/mcp/tools")
+    @app.get("/mcp", dependencies=[Depends(auth)])
+    @app.get("/mcp/tools", dependencies=[Depends(auth)])
     def mcp_tools() -> dict[str, Any]:
         return {
+            "name": "messjar",
+            "version": "0.1.0",
+            "description": "Mess&Jar peer agent bus",
             "tools": [
                 {
                     "name": "send",
@@ -224,10 +235,10 @@ def create_app(store: Store) -> FastAPI:
                         },
                     },
                 },
-            ]
+            ],
         }
 
-    @app.post("/mcp/call")
+    @app.post("/mcp/call", dependencies=[Depends(auth)])
     def mcp_call(payload: dict[str, Any]) -> dict[str, Any]:
         name = payload.get("name")
         args = payload.get("arguments") or {}
@@ -242,9 +253,7 @@ def create_app(store: Store) -> FastAPI:
                 )
                 if body.ack:
                     for item in batch:
-                        jar_id = item["jar"]["id"]
-                        seq = item["cursor"]
-                        store.advance_cursor(jar_id, body.agent, seq)
+                        store.advance_cursor(item["jar"]["id"], body.agent, item["cursor"])
                 return {"content": [{"type": "json", "json": batch}]}
             if name == "wait":
                 body = WaitBody.model_validate(args)
@@ -274,14 +283,15 @@ def create_app(store: Store) -> FastAPI:
         except Exception as e:
             raise HTTPException(400, str(e)) from e
 
+    @app.middleware("http")
+    async def force_https_hint(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response = await call_next(request)
+        # Help reverse proxies / clients know this bus expects https in prod.
+        if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
     return app
-
-
-def _resolve_jar_id(store: Store, jar: str) -> str:
-    j = store.get_jar(jar)
-    if not j:
-        raise KeyError(f"jar not found: {jar}")
-    return j.id
 
 
 def _send(store: Store, body: SendBody) -> dict[str, Any]:
@@ -304,9 +314,26 @@ def _send(store: Store, body: SendBody) -> dict[str, Any]:
         raise HTTPException(400, str(e)) from e
 
 
-def run_server(db: str | Path, host: str = "127.0.0.1", port: int = 7420) -> None:
+def run_server(
+    database_url: str | None = None,
+    host: str = "0.0.0.0",
+    port: int = 7420,
+) -> None:
     import uvicorn
 
-    store = Store(db)
+    url = database_url or os.environ.get("DATABASE_URL")
+    if not url:
+        raise SystemExit("DATABASE_URL is required (PostgreSQL connection string)")
+    if not configured_password() and os.environ.get("MESSJAR_REQUIRE_AUTH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        raise SystemExit("MESSJAR_PASSWORD is required when MESSJAR_REQUIRE_AUTH=1")
+
+    store = Store(normalize_database_url(url))
     app = create_app(store)
+    label = database_host_label(url)
+    auth_state = "on" if configured_password() else "OFF (set MESSJAR_PASSWORD)"
+    print(f"Mess&Jar bus postgres={label} auth={auth_state} http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="info")

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "messjar": {
+      "url": "https://YOUR-APP.up.railway.app/mcp",
+      "headers": {
+        "Authorization": "Bearer SHARED_PASSWORD_BOTH_SIDES_USE"
+      }
+    }
+  }
+}

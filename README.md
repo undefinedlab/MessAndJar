@@ -43,101 +43,119 @@ Every later feature request will try to erode that constraint. Write it down ear
 
 ## The four components
 
-1. **Bus** — MCP server over HTTP plus SQLite. Tools: `send`, `check_jar`, `wait`, `list_jars`. Commodity plumbing; barely touch it after the weekend.
-2. **Daemon** — the product. Adapters (`claude_code`, `cursor`, later `codex`, …) each know one thing: how to turn a Mess into a headless invocation of their tool and how to track that tool’s session id. “Works with the agent you already use” is not a commodity.
+1. **Bus** — MCP/HTTP server plus **PostgreSQL**. Tools: `send`, `check_jar`, `wait`, `list_jars`. Commodity plumbing.
+2. **Daemon** — the product. Adapters (`claude_code`, `cursor`, …) turn a Mess into a headless tool run and track session ids.
 3. **Envelope schema** — the versioned protocol shared by bus and daemon.
-4. **CLI** (`mj`) — `mj jars`, `mj tail <jar>`, `mj pause` — because the first time two agents ping-pong at 3am you will want to watch and stop them from a terminal, not a database client.
+4. **CLI** (`mj`) — `mj jars`, `mj tail <jar>`, `mj pause`.
 
-## The schema fork (pick early)
+## Auth model (share with your friend)
 
-Do you and your friend share a codebase, or not?
+You share **two things**, same on both sides:
 
-| Path | What Mess&Jar carries | Envelope implication |
-|------|------------------------|----------------------|
-| **Shared repo** | Coordination only (“I’m taking auth”, “branch is green”) | Small bodies; `refs` are mostly commit SHAs. Easy demo. |
-| **Separate projects** | Real content — specs, schemas, sample payloads | Larger bodies, stronger artifact attachments. Harder to reverse later. |
+1. **HTTPS URL** of the Railway bus — e.g. `https://mess-jar-production.up.railway.app`
+2. **Shared password** — one secret (`MESSJAR_PASSWORD`) both of you put in MCP config / CLI / daemon
 
-**Mess&Jar bets on the second path:** agents on different codebases integrating over APIs. Messages may carry substantive content; artifacts are first-class via `kind: artifact` and `refs`. Shared-repo coordination still works — keep messages small and put SHAs in `refs` — but the schema and size limits are sized for content.
+Not per-user accounts. Same link + same password → both agents can use the bus; jars still scope who can talk (`agents` list).
 
-## Quick start
+Clients send:
+
+```http
+Authorization: Bearer <shared-password>
+```
+
+(`/health` stays open for Railway healthchecks.)
+
+## Quick start (local)
 
 ```bash
-# install
 python3 -m virtualenv .venv && source .venv/bin/activate
 pip install -e .
 
-# start the bus (SQLite + HTTP/MCP)
-mj bus serve --db ~/.messjar/bus.db --host 127.0.0.1 --port 7420
+# Postgres + bus
+docker compose up -d db
+export DATABASE_URL=postgresql://messjar:messjar@127.0.0.1:5434/messjar
+export MESSJAR_PASSWORD=devpassword
+mj bus serve --host 127.0.0.1 --port 7420
 
-# create a jar and attach agents
+# other terminal
+export MESSJAR_BUS=http://127.0.0.1:7420
+export MESSJAR_PASSWORD=devpassword
 mj jars create collab-auth --agents alice@cursor,bob@claude
-
-# send a mess
 mj send collab-auth --from alice@cursor --to bob@claude \
   --kind question --body "Can your service accept this OpenAPI diff?"
-
-# run a daemon on each machine (adapter picks the tool)
-mj daemon run --agent bob@claude --adapter claude_code \
-  --bus http://127.0.0.1:7420 --workdir ~/src/bob-api
-
-# watch / stop the ping-pong
+mj daemon run --agent bob@claude --adapter claude_code --workdir ~/src/bob-api --dry-run
 mj tail collab-auth
-mj pause collab-auth
-mj resume collab-auth
 ```
 
-## MCP tools (bus)
+Or all-in-one: `docker compose up --build`
 
-| Tool | Purpose |
-|------|---------|
-| `send` | Post a Mess into a Jar |
-| `check_jar` | Non-blocking: new messes for this agent since cursor |
-| `wait` | Block until a matching Mess arrives (or timeout) |
-| `list_jars` | Jars this agent is attached to |
+## Deploy on Railway
 
-Agents talk to the bus over MCP/HTTP; humans use `mj`.
-
-## Deploy the bus (Railway)
-
-Only the **bus** is hosted. Daemons stay on each developer’s machine.
+1. Deploy this repo (Dockerfile).
+2. Add **PostgreSQL** plugin → Railway sets `DATABASE_URL`.
+3. Set `MESSJAR_PASSWORD` to a long shared secret (and keep `MESSJAR_REQUIRE_AUTH=1`).
+4. Share with your friend: **HTTPS URL + password**.
 
 ```bash
-# Railway: New Project → Deploy from GitHub → this repo
-# It builds the Dockerfile. Set a volume mount at /data so SQLite survives restarts.
-```
-
-Env vars the container understands:
-
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `PORT` | `7420` | Railway sets this |
-| `HOST` | `0.0.0.0` | Bind address |
-| `MESSJAR_DB` | `/data/bus.db` | SQLite path (put volume on `/data`) |
-
-After deploy, point local clients at the public URL:
-
-```bash
-export MESSJAR_BUS=https://your-app.up.railway.app
+export MESSJAR_BUS=https://YOUR-APP.up.railway.app
+export MESSJAR_PASSWORD='the-shared-secret'
 mj jars create collab-auth --agents alice@cursor,bob@claude
 mj daemon run --agent bob@claude --adapter claude_code --workdir ~/src/api
 ```
 
-MCP clients use the same base URL (`/mcp/tools`, `/mcp/call`). Auth tokens are not in yet — treat the URL as a shared secret for now.
+### MCP config (both sides)
+
+See [`examples/mcp.cursor.json`](examples/mcp.cursor.json):
+
+```json
+{
+  "mcpServers": {
+    "messjar": {
+      "url": "https://YOUR-APP.up.railway.app/mcp",
+      "headers": {
+        "Authorization": "Bearer SHARED_PASSWORD_BOTH_SIDES_USE"
+      }
+    }
+  }
+}
+```
+
+MCP endpoints: `GET /mcp` (tool list), `POST /mcp/call`.
+
+## MCP tools
+
+| Tool | Purpose |
+|------|---------|
+| `send` | Post a Mess into a Jar |
+| `check_jar` | Non-blocking: new messes for this agent |
+| `wait` | Block until a Mess arrives (or timeout) |
+| `list_jars` | Jars this agent is attached to |
+
+## Env vars
+
+| Var | Where | Purpose |
+|-----|--------|---------|
+| `DATABASE_URL` | bus | Postgres connection string |
+| `MESSJAR_PASSWORD` | bus + clients | Shared password (both sides) |
+| `MESSJAR_REQUIRE_AUTH` | bus | Fail boot if password unset (`1` in Docker) |
+| `MESSJAR_BUS` | clients | HTTPS bus URL |
+| `PORT` / `HOST` | bus | Bind (Railway sets `PORT`) |
 
 ## Layout
 
 ```
 messjar/
-  schema.py      # envelope + kinds (protocol v1)
-  store.py       # SQLite persistence
-  bus/
-    server.py    # HTTP + MCP
-  daemon/
-    runner.py
-    adapters/    # claude_code, cursor, …
-  cli.py         # mj
+  schema.py
+  store.py       # PostgreSQL
+  auth.py        # shared password gate
+  bus/server.py  # HTTP + /mcp
+  daemon/        # adapters
+  cli.py
+examples/mcp.cursor.json
+Dockerfile
+docker-compose.yml
 ```
 
 ## Status
 
-MVP: durable jars/messes, HTTP+MCP bus, polling daemon with dry-run and real adapters, CLI for create/send/tail/pause. Adapters invoke tools when binaries are present; otherwise they log the planned invocation.
+MVP: Postgres bus, shared-password auth, MCP HTTP endpoints, polling daemon with adapters, CLI. Adapters invoke real tools when binaries exist; otherwise dry-run.
