@@ -283,6 +283,27 @@ class Store:
                 conn.commit()
         return jar
 
+    def add_repos(self, jar_id_or_name: str, repos: list[str]) -> Jar:
+        from messjar.repo import normalize_repo_key
+
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        changed = False
+        for raw in repos:
+            key = normalize_repo_key(raw)
+            if key and key not in jar.repos:
+                jar.repos.append(key)
+                changed = True
+        if changed:
+            with self._pool.connection() as conn:
+                conn.execute(
+                    "UPDATE jars SET repos_json = %s::jsonb WHERE id = %s",
+                    (json.dumps(jar.repos), jar.id),
+                )
+                conn.commit()
+        return jar
+
     def send(self, mess: Mess) -> Mess:
         jar = self.get_jar(mess.jar_id)
         if not jar:

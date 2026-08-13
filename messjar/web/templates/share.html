@@ -12,28 +12,85 @@
 <body>
   <main class="shell">
     <h1 class="brand">Mess<span>&</span>Jar</h1>
-    <p class="lede">Join jar <strong>{{ jar }}</strong>. Pick the tool you actually use — your agent id is created for you.</p>
 
     {% if error %}
+    <p class="lede">Couldn’t open this jar.</p>
     <section class="panel">
       <p class="error">{{ error }}</p>
       <p class="hint">Open the full share link (it includes <code>?p=</code>).</p>
     </section>
     {% else %}
-    <section class="panel reveal">
-      <div class="meta">
-        <div>Bus <strong>{{ bus_url }}</strong></div>
-        <div>Jar <strong>{{ jar }}</strong></div>
-        <div>Repos keys <strong>{{ repos | join(', ') }}</strong></div>
-        {% if agents %}
-        <div>Already joined <strong>{{ agents | join(', ') }}</strong></div>
-        {% endif %}
-      </div>
+    <p class="lede">Jar <strong>{{ jar }}</strong> — members, repos, recent messes, and join.</p>
 
-      <h2>Join</h2>
+    <section class="panel reveal">
+      <h2>{{ jar }}</h2>
+      <div class="meta">
+        <div>Id <strong>{{ jar_id }}</strong></div>
+        <div>Created <strong>{{ created_at }}</strong></div>
+        <div>Status <strong>{% if paused %}paused{% else %}active{% endif %}</strong></div>
+        <div>Bus <strong>{{ bus_url }}</strong></div>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" data-copy="{{ share_url }}">Copy share link</button>
+      </div>
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Members <span class="count">{{ agents|length }}</span></h2>
+      {% if agents %}
+      <ul class="chip-list" id="member-list">
+        {% for a in agents %}
+        <li><code>{{ a }}</code></li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <p class="hint">No one has joined yet — use the form below.</p>
+      <ul class="chip-list" id="member-list"></ul>
+      {% endif %}
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Repos keys</h2>
+      <p class="hint">Used so one MCP connection can pick this jar from the project folder / git remote.</p>
+      <ul class="chip-list" id="repo-list">
+        {% for r in repos %}
+        <li><code>{{ r }}</code></li>
+        {% endfor %}
+      </ul>
+      <label for="repo-input">Add repo key</label>
+      <div class="inline-row">
+        <input id="repo-input" type="text" placeholder="github.com/org/repo" />
+        <button type="button" id="add-repo-btn">Add</button>
+      </div>
+      <p id="repo-err" class="error hidden"></p>
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Recent messes</h2>
+      {% if recent %}
+      <div class="mess-feed" id="mess-feed">
+        {% for m in recent %}
+        <article class="mess-row">
+          <header>
+            <span class="kind">{{ m.kind }}</span>
+            <span class="who">{{ m.from }} → {{ m.to }}</span>
+            <span class="when">{{ m.ts }}</span>
+          </header>
+          <pre>{{ m.body }}</pre>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="hint">No messes yet.</p>
+      <div class="mess-feed" id="mess-feed"></div>
+      {% endif %}
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Join this jar</h2>
       <label for="display-name">Display name (optional)</label>
       <input id="display-name" type="text" placeholder="alex" autocomplete="nickname" />
-      <p class="hint">Becomes part of your id, e.g. <code>alex@cursor</code>. Leave blank for a random handle.</p>
+      <p class="hint">Becomes part of your id, e.g. <code>alex@cursor</code>.</p>
 
       <label>Your tool</label>
       <div class="tabs" id="tool-tabs">
@@ -77,6 +134,14 @@
         selectedTool = tab.dataset.tool;
       });
     });
+    document.querySelectorAll('[data-copy]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(btn.getAttribute('data-copy') || '');
+        const old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = old; }, 900);
+      });
+    });
     document.querySelectorAll('[data-copy-target]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const t = document.getElementById(btn.getAttribute('data-copy-target'));
@@ -86,9 +151,43 @@
         setTimeout(() => { btn.textContent = old; }, 900);
       });
     });
+
+    const metaEl = document.getElementById('join-meta');
+    const meta = metaEl ? JSON.parse(metaEl.textContent) : null;
+
+    const addRepoBtn = document.getElementById('add-repo-btn');
+    if (addRepoBtn && meta) {
+      addRepoBtn.addEventListener('click', async () => {
+        const err = document.getElementById('repo-err');
+        err.classList.add('hidden');
+        const value = document.getElementById('repo-input').value.trim();
+        if (!value) return;
+        try {
+          const res = await fetch('/api/jars/repos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jar: meta.jar, password: meta.password, repos: [value] }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'add failed');
+          const list = document.getElementById('repo-list');
+          list.innerHTML = '';
+          (data.repos || []).forEach((r) => {
+            const li = document.createElement('li');
+            li.innerHTML = '<code></code>';
+            li.querySelector('code').textContent = r;
+            list.appendChild(li);
+          });
+          document.getElementById('repo-input').value = '';
+        } catch (e) {
+          err.textContent = e.message || String(e);
+          err.classList.remove('hidden');
+        }
+      });
+    }
+
     const joinBtn = document.getElementById('join-btn');
-    if (joinBtn) {
-      const meta = JSON.parse(document.getElementById('join-meta').textContent);
+    if (joinBtn && meta) {
       joinBtn.addEventListener('click', async () => {
         const err = document.getElementById('join-err');
         err.classList.add('hidden');
@@ -112,6 +211,14 @@
           document.getElementById('agent-mcp-block').textContent = data.mcp_json_text;
           const daemon = (data.daemon && (data.daemon[selectedTool] || data.daemon.claude_code || data.daemon.cursor)) || '';
           document.getElementById('daemon-block').textContent = daemon;
+          const list = document.getElementById('member-list');
+          list.innerHTML = '';
+          (data.agents || []).forEach((a) => {
+            const li = document.createElement('li');
+            li.innerHTML = '<code></code>';
+            li.querySelector('code').textContent = a;
+            list.appendChild(li);
+          });
         } catch (e) {
           err.textContent = e.message || String(e);
           err.classList.remove('hidden');

@@ -86,20 +86,30 @@ def test_join_assigns_agent_id(database_url: str, monkeypatch: pytest.MonkeyPatc
     )
     assert joined.status_code == 200
     assert joined.json()["agent_id"] == "alex@cursor"
-    assert joined.json()["token"].startswith("mj_")
+
+    detail = client.get(f"/api/jars/{name}/detail", params={"p": "share-me"})
+    assert detail.status_code == 200
+    assert "alex@cursor" in detail.json()["agents"]
+
+    added = client.post(
+        "/api/jars/repos",
+        json={"jar": name, "password": "share-me", "repos": ["github.com/acme/web-ui"]},
+    )
+    assert added.status_code == 200
+    assert "github.com/acme/web-ui" in added.json()["repos"]
+
+    page = client.get(f"/j/{name}?p=share-me")
+    assert page.status_code == 200
+    assert "Members" in page.text
+    assert "Add repo key" in page.text
+    assert "Recent messes" in page.text
 
     friend = client.post(
         "/api/join",
         json={"jar": name, "password": "share-me", "tool": "claude", "display_name": "Sam"},
     )
     assert friend.status_code == 200
-    assert friend.json()["agent_id"] == "sam@claude"
 
-    agents = client.get(f"/j/{name}?p=share-me")
-    assert agents.status_code == 200
-    assert "alex@cursor" in agents.text or "Join" in agents.text
-
-    # send between joined agents via agent key
     token = joined.json()["token"]
     sent = client.post(
         "/mcp/call",

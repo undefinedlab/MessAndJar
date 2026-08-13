@@ -42,6 +42,12 @@ class JoinBody(BaseModel):
     display_name: str | None = None
 
 
+class AddReposBody(BaseModel):
+    jar: str
+    password: str
+    repos: list[str]
+
+
 class SendBody(BaseModel):
     jar: str | None = None
     from_agent: str = Field(alias="from")
@@ -206,7 +212,54 @@ def create_app(store: Store) -> FastAPI:
             agents=jar.agents,
             repos=jar.repos,
         )
-        return templates.TemplateResponse(request, "share.html", {"error": None, **bundle})
+        recent = [
+            m.model_dump(by_alias=True)
+            for m in store.list_messes(jar.id, after_seq=0, limit=30)
+        ]
+        # show newest first in UI
+        recent = list(reversed(recent[-15:]))
+        return templates.TemplateResponse(
+            request,
+            "share.html",
+            {
+                "error": None,
+                **bundle,
+                "jar_id": jar.id,
+                "created_at": jar.created_at,
+                "paused": jar.paused,
+                "recent": recent,
+            },
+        )
+
+    @app.get("/api/jars/{jar_name}/detail")
+    def jar_detail_api(jar_name: str, p: str = Query(..., description="Jar password")) -> dict[str, Any]:
+        jar = store.get_jar(jar_name)
+        if not jar or not jar.password or not passwords_match(p, jar.password):
+            raise HTTPException(401, "bad jar password")
+        messes = store.list_messes(jar.id, after_seq=0, limit=50)
+        return {
+            "id": jar.id,
+            "jar": jar.name,
+            "agents": jar.agents,
+            "repos": jar.repos,
+            "paused": jar.paused,
+            "created_at": jar.created_at,
+            "mess_count": len(messes),
+            "recent": [m.model_dump(by_alias=True) for m in messes[-20:]],
+        }
+
+    @app.post("/api/jars/repos")
+    def add_jar_repos(body: AddReposBody) -> dict[str, Any]:
+        jar = store.get_jar(body.jar)
+        if not jar or not jar.password or not passwords_match(body.password, jar.password):
+            raise HTTPException(401, "bad jar password")
+        if not body.repos:
+            raise HTTPException(400, "repos required")
+        try:
+            jar = store.add_repos(jar.id, body.repos)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"jar": jar.name, "repos": jar.repos, "agents": jar.agents}
 
     @app.post("/api/jars")
     def public_create_jar(request: Request, body: CreateJarBody) -> dict[str, Any]:
