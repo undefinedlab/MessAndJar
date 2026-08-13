@@ -470,9 +470,16 @@ def run_server(
 ) -> None:
     import uvicorn
 
-    url = database_url or os.environ.get("DATABASE_URL")
+    url = database_url or os.environ.get("DATABASE_URL") or os.environ.get(
+        "DATABASE_PRIVATE_URL"
+    )
     if not url:
-        raise SystemExit("DATABASE_URL is required (PostgreSQL connection string)")
+        raise SystemExit(
+            "DATABASE_URL is missing.\n"
+            "On Railway: Project → + New → Database → Add PostgreSQL, then on this "
+            "service Variables → Variable Reference → Postgres → DATABASE_URL.\n"
+            "Redeploy after the variable is set."
+        )
 
     store = Store(normalize_database_url(url))
     app = create_app(store)

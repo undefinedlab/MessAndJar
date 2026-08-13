@@ -56,10 +56,17 @@ mj bus serve --host 127.0.0.1 --port 7420
 
 ## Deploy on Railway
 
-1. Deploy this repo (Dockerfile)
-2. Add **PostgreSQL** → `DATABASE_URL`
-3. Optional: set `MESSJAR_PASSWORD` for admin
-4. Open the public URL → create jar → share the link
+Image builds fine; healthchecks fail if Postgres isn’t linked (logs show `DATABASE_URL is missing`).
+
+1. Deploy this repo (Dockerfile) — you already did
+2. In the **same project**: **+ New → Database → PostgreSQL**
+3. Open your **Mess&Jar service → Variables → Add Variable Reference**
+   - Select the Postgres plugin → `DATABASE_URL`
+4. Optional: `MESSJAR_PASSWORD` (admin)
+5. **Redeploy** the web service
+6. Open the public URL → create a jar → share the link
+
+`DATABASE_URL` must appear on the **app** service variables (not only on the database card).
 
 ## MCP
 
