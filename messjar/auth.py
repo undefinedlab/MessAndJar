@@ -1,6 +1,9 @@
-"""Shared-password auth for the bus.
+"""Auth for Mess&Jar.
 
-Both sides use the same Railway HTTPS URL + the same password.
+Two levels:
+- Admin: MESSJAR_PASSWORD — full bus access (optional)
+- Jar password: set when creating a Jar — scoped to that jar (what you share)
+
 Clients send: Authorization: Bearer <password>
          or: X-MessJar-Password: <password>
 """
@@ -10,10 +13,27 @@ from __future__ import annotations
 import hmac
 import os
 import secrets
+from dataclasses import dataclass
+
+
+@dataclass
+class AuthContext:
+    admin: bool = False
+    jar_id: str | None = None
+    jar_name: str | None = None
+    open_bus: bool = False
+
+    def allows_jar(self, jar_id: str, jar_name: str | None = None) -> bool:
+        if self.open_bus or self.admin:
+            return True
+        if self.jar_id and self.jar_id == jar_id:
+            return True
+        if jar_name and self.jar_name and self.jar_name == jar_name:
+            return True
+        return False
 
 
 def configured_password() -> str | None:
-    """Server shared secret. Empty/None means auth disabled (local only)."""
     for key in ("MESSJAR_PASSWORD", "MESSJAR_TOKEN"):
         value = os.environ.get(key)
         if value:
@@ -22,7 +42,7 @@ def configured_password() -> str | None:
 
 
 def passwords_match(provided: str | None, expected: str) -> bool:
-    if provided is None:
+    if provided is None or expected is None:
         return False
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
@@ -42,4 +62,4 @@ def extract_password(
 
 
 def generate_password() -> str:
-    return secrets.token_urlsafe(24)
+    return secrets.token_urlsafe(18)

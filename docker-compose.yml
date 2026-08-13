@@ -21,8 +21,7 @@ services:
       - "7420:7420"
     environment:
       DATABASE_URL: postgresql://messjar:messjar@db:5432/messjar
-      MESSJAR_PASSWORD: devpassword
-      MESSJAR_REQUIRE_AUTH: "1"
+      MESSJAR_PASSWORD: admin-optional
       PORT: "7420"
       HOST: "0.0.0.0"
     depends_on:

@@ -198,7 +198,9 @@ def resume_jar(
 @daemon_app.command("run")
 def daemon_run(
     agent: str = typer.Option(..., "--agent"),
-    adapter: str = typer.Option(..., "--adapter", help="claude_code | cursor"),
+    adapter: str = typer.Option(
+        ..., "--adapter", help="claude_code | cursor | codex | opencode"
+    ),
     workdir: Path = typer.Option(Path.cwd(), "--workdir"),
     jar: Optional[str] = typer.Option(None, "--jar"),
     bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),

@@ -5,8 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
-    PORT=7420 \
-    MESSJAR_REQUIRE_AUTH=1
+    PORT=7420
 
 COPY pyproject.toml README.md ./
 COPY messjar ./messjar
@@ -15,5 +14,5 @@ RUN pip install --no-cache-dir .
 
 EXPOSE 7420
 
-# Requires Railway: DATABASE_URL (Postgres plugin) + MESSJAR_PASSWORD (shared secret)
+# Requires Railway Postgres plugin (DATABASE_URL). Optional: MESSJAR_PASSWORD (admin).
 CMD ["mj", "bus", "serve", "--host", "0.0.0.0"]

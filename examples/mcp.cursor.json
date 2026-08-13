@@ -3,7 +3,7 @@
     "messjar": {
       "url": "https://YOUR-APP.up.railway.app/mcp",
       "headers": {
-        "Authorization": "Bearer SHARED_PASSWORD_BOTH_SIDES_USE"
+        "Authorization": "Bearer JAR_PASSWORD_FROM_SHARE_LINK"
       }
     }
   }

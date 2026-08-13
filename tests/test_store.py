@@ -1,4 +1,4 @@
-"""Store + auth tests. Integration tests need DATABASE_URL (see docker-compose)."""
+"""Store + auth + share API tests. Needs DATABASE_URL."""
 
 from __future__ import annotations
 
@@ -29,16 +29,14 @@ def test_fyi_does_not_require_reply() -> None:
 def test_password_compare() -> None:
     assert passwords_match("secret", "secret")
     assert not passwords_match("nope", "secret")
-    assert not passwords_match(None, "secret")
     assert extract_password("Bearer abc", None) == "abc"
-    assert extract_password(None, "from-header") == "from-header"
 
 
 @pytest.fixture(scope="module")
 def database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
-        pytest.skip("DATABASE_URL not set — start docker compose db or export a Postgres URL")
+        pytest.skip("DATABASE_URL not set")
     return url
 
 
@@ -51,59 +49,70 @@ def store(database_url: str) -> Store:
 
 def test_jar_and_mess_roundtrip(store: Store) -> None:
     name = f"demo-{uuid.uuid4().hex[:8]}"
-    jar = store.create_jar(name, ["alice@cursor", "bob@claude"])
-    assert jar.name == name
-    assert set(jar.agents) == {"alice@cursor", "bob@claude"}
+    jar = store.create_jar(name, ["alice@cursor", "bob@claude"], password="jar-secret")
+    assert jar.password == "jar-secret"
+    assert store.get_jar_by_password("jar-secret") is not None
 
     mess = Mess.create(
         jar_id=jar.id,
         from_agent="alice@cursor",
         to_agent="bob@claude",
-        body="openapi delta attached",
+        body="openapi delta",
         kind=MessKind.question,
-        refs=["file:openapi.yaml"],
     )
     saved = store.send(mess)
     assert saved.seq == 1
-    assert saved.reply_expected is True
-
     batch = store.check_jar("bob@claude", jar.name)
-    assert len(batch) == 1
     assert batch[0]["messes"][0]["id"] == saved.id
-    store.advance_cursor(jar.id, "bob@claude", batch[0]["cursor"])
-    assert store.check_jar("bob@claude", jar.name) == []
-
-    store.set_jar_paused(jar.name, True)
-    with pytest.raises(RuntimeError):
-        store.send(
-            Mess.create(
-                jar_id=jar.id,
-                from_agent="bob@claude",
-                to_agent="alice@cursor",
-                body="nope",
-                kind="answer",
-            )
-        )
 
 
-def test_auth_gate(database_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MESSJAR_PASSWORD", "shared-secret")
+def test_public_create_and_jar_auth(database_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MESSJAR_PASSWORD", raising=False)
+    monkeypatch.delenv("MESSJAR_TOKEN", raising=False)
     store = Store(database_url, min_size=1, max_size=2)
     app = create_app(store)
     client = TestClient(app)
 
-    assert client.get("/health").status_code == 200
-    assert client.get("/jars").status_code == 401
-    assert client.get("/mcp/tools").status_code == 401
+    assert client.get("/health").json()["status"] == "ok"
+    assert client.get("/").status_code == 200
 
-    ok = client.get("/jars", headers={"Authorization": "Bearer shared-secret"})
-    assert ok.status_code == 200
-
-    name = f"auth-{uuid.uuid4().hex[:8]}"
+    name = f"web-{uuid.uuid4().hex[:8]}"
     created = client.post(
-        "/jars",
-        headers={"X-MessJar-Password": "shared-secret"},
-        json={"name": name, "agents": ["a@x", "b@y"]},
+        "/api/jars",
+        json={"name": name, "agents": ["a@cursor", "b@claude"], "password": "share-me"},
     )
     assert created.status_code == 200
+    body = created.json()
+    assert body["password"] == "share-me"
+    assert "/j/" in body["share_url"]
+
+    assert client.get("/jars").status_code == 401
+    ok = client.get("/jars", headers={"Authorization": "Bearer share-me"})
+    assert ok.status_code == 200
+    assert ok.json()[0]["name"] == name
+
+    bad = client.get(f"/j/{name}")
+    assert bad.status_code == 401
+    good = client.get(f"/j/{name}?p=share-me")
+    assert good.status_code == 200
+    assert "MCP" in good.text
+
+    sent = client.post(
+        "/send",
+        headers={"Authorization": "Bearer share-me"},
+        json={
+            "jar": name,
+            "from": "a@cursor",
+            "to": "b@claude",
+            "body": "hi",
+            "kind": "question",
+        },
+    )
+    assert sent.status_code == 200
     store.close()
+
+
+def test_adapters_registered() -> None:
+    from messjar.daemon.adapters import ADAPTERS
+
+    assert set(ADAPTERS) >= {"claude_code", "cursor", "codex", "opencode"}

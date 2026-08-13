@@ -57,7 +57,8 @@ class Store:
                     paused BOOLEAN NOT NULL DEFAULT FALSE,
                     archived BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMPTZ NOT NULL,
-                    meta_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    meta_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    password TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS messes (
@@ -80,16 +81,32 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_messes_to ON messes (to_agent, jar_id, seq);
                 """
             )
+            # upgrades from earlier schema
+            conn.execute(
+                """
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS password TEXT;
+                CREATE INDEX IF NOT EXISTS idx_jars_password ON jars (password);
+                """
+            )
             conn.commit()
 
-    def create_jar(self, name: str, agents: list[str], meta: dict[str, Any] | None = None) -> Jar:
-        jar = Jar.create(name=name, agents=agents, meta=meta)
+    def create_jar(
+        self,
+        name: str,
+        agents: list[str],
+        meta: dict[str, Any] | None = None,
+        password: str | None = None,
+    ) -> Jar:
+        jar = Jar.create(name=name, agents=agents, meta=meta, password=password)
         with self._pool.connection() as conn:
             try:
                 conn.execute(
                     """
-                    INSERT INTO jars (id, name, agents_json, local_json, paused, archived, created_at, meta_json)
-                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)
+                    INSERT INTO jars (
+                        id, name, agents_json, local_json, paused, archived,
+                        created_at, meta_json, password
+                    )
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s)
                     """,
                     (
                         jar.id,
@@ -100,6 +117,7 @@ class Store:
                         jar.archived,
                         jar.created_at,
                         json.dumps(jar.meta),
+                        jar.password,
                     ),
                 )
                 conn.commit()
@@ -109,6 +127,14 @@ class Store:
                     raise ValueError(f"jar name already exists: {name}") from e
                 raise
         return jar
+
+    def get_jar_by_password(self, password: str) -> Jar | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM jars WHERE password = %s AND archived = FALSE LIMIT 1",
+                (password,),
+            ).fetchone()
+        return self._row_to_jar(row) if row else None
 
     def get_jar(self, jar_id_or_name: str) -> Jar | None:
         with self._pool.connection() as conn:
@@ -329,6 +355,7 @@ class Store:
             archived=bool(row["archived"]),
             created_at=created_at,
             meta=dict(self._as_json(row["meta_json"] or {})),
+            password=row.get("password"),
         )
 
     def _row_to_mess(self, row: dict[str, Any]) -> Mess:

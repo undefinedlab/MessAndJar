@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ jar }} · Mess&Jar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=Sora:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <main class="shell">
+    <h1 class="brand">Mess<span>&</span>Jar</h1>
+    <p class="lede">You're invited to jar <strong>{{ jar }}</strong>. Pick your tool, paste the config, run the daemon.</p>
+
+    {% if error %}
+    <section class="panel">
+      <p class="error">{{ error }}</p>
+      <p class="hint">Open the full share link (it includes <code>?p=</code>), or ask the creator for the jar password.</p>
+    </section>
+    {% else %}
+    <section class="panel reveal">
+      <div class="meta">
+        <div>Bus <strong>{{ bus_url }}</strong></div>
+        <div>Jar <strong>{{ jar }}</strong></div>
+        <div>Password <strong>{{ password }}</strong></div>
+        <div>Agents <strong>{{ agents | join(', ') }}</strong></div>
+      </div>
+
+      <div class="actions">
+        <button type="button" class="secondary" data-copy="{{ share_url }}">Copy share link</button>
+        <button type="button" class="secondary" data-copy="{{ password }}">Copy password</button>
+      </div>
+
+      <h2 style="margin-top:1.4rem">MCP (Cursor / Claude / Codex / OpenCode)</h2>
+      <p class="hint">Add this server in your MCP settings. Same password for everyone on this jar.</p>
+      <div class="mono" id="mcp-block">{{ mcp_json_text }}</div>
+      <button type="button" class="secondary" data-copy-target="mcp-block">Copy MCP JSON</button>
+
+      <h2 style="margin-top:1.4rem">Daemon (unattended)</h2>
+      <div class="tabs" id="daemon-tabs">
+        <button type="button" class="tab active" data-tool="cursor">Cursor</button>
+        <button type="button" class="tab" data-tool="claude_code">Claude Code</button>
+        <button type="button" class="tab" data-tool="codex">Codex</button>
+        <button type="button" class="tab" data-tool="opencode">OpenCode</button>
+      </div>
+      <div class="mono" id="daemon-block">{{ daemon.cursor }}</div>
+      <button type="button" class="secondary" data-copy-target="daemon-block">Copy command</button>
+
+      <h2 style="margin-top:1.4rem">CLI env</h2>
+      <div class="mono" id="env-block">{{ cli_export }}</div>
+      <button type="button" class="secondary" data-copy-target="env-block">Copy env</button>
+    </section>
+    <script type="application/json" id="daemon-json">{{ daemon | tojson }}</script>
+    {% endif %}
+
+    <p class="foot"><a href="/">Create another jar</a></p>
+  </main>
+  <script>
+    const daemonMap = (() => {
+      const el = document.getElementById('daemon-json');
+      return el ? JSON.parse(el.textContent) : {};
+    })();
+    const block = document.getElementById('daemon-block');
+    document.querySelectorAll('#daemon-tabs .tab').forEach((tab) => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('#daemon-tabs .tab').forEach((t) => t.classList.remove('active'));
+        tab.classList.add('active');
+        if (block) block.textContent = daemonMap[tab.dataset.tool] || '';
+      });
+    });
+    document.querySelectorAll('[data-copy]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(btn.getAttribute('data-copy') || '');
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = btn.textContent.replace('Copied', btn.dataset.label || 'Copy'); }, 900);
+      });
+    });
+    document.querySelectorAll('[data-copy-target]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const t = document.getElementById(btn.getAttribute('data-copy-target'));
+        await navigator.clipboard.writeText(t ? t.textContent : '');
+        const old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = old; }, 900);
+      });
+    });
+  </script>
+</body>
+</html>

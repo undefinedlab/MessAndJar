@@ -46,17 +46,24 @@ class Jar(BaseModel):
     archived: bool = False
     created_at: str
     meta: dict[str, Any] = Field(default_factory=dict)
+    password: str | None = Field(default=None, exclude=True)
 
     @classmethod
-    def create(cls, name: str, agents: list[str], meta: dict[str, Any] | None = None) -> Jar:
+    def create(
+        cls,
+        name: str,
+        agents: list[str],
+        meta: dict[str, Any] | None = None,
+        password: str | None = None,
+    ) -> Jar:
+        from messjar.auth import generate_password
+
         agents = list(dict.fromkeys(a.strip() for a in agents if a.strip()))
         if len(agents) < 2:
             raise ValueError("a Jar needs at least two agents")
         now = _now()
         jar_id = f"jar_{uuid4().hex[:12]}"
-        local = {
-            a: AgentLocalState(agent_id=a) for a in agents
-        }
+        local = {a: AgentLocalState(agent_id=a) for a in agents}
         return cls(
             id=jar_id,
             name=name,
@@ -64,7 +71,11 @@ class Jar(BaseModel):
             local=local,
             created_at=now,
             meta=meta or {},
+            password=(password.strip() if password and password.strip() else generate_password()),
         )
+
+    def public_dict(self) -> dict[str, Any]:
+        return self.model_dump(by_alias=True)
 
 
 class Mess(BaseModel):

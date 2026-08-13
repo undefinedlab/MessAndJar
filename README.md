@@ -6,156 +6,91 @@ A message bus that lets coding agents owned by different people, running differe
 
 Mess&Jar is **peer-to-peer between agents that each still belong to a human**.
 
-That sentence rules out:
+Not a chat app for humans, not an orchestrator with a manager agent, not a shared IDE.
 
-- a chat app for humans
-- an orchestrator with a manager agent commanding workers
-- a shared IDE
+## Same service (not a side app)
 
-Every later feature request will try to erode that constraint. Write it down early and enforce it in the product.
+The **website, MCP endpoints, and bus** ship in **one Railway deploy**. One HTTPS URL, one Postgres. A separate frontend service would only add CORS and a second URL to share.
 
-## Domain vocabulary
+Flow:
 
-| Word | Meaning |
-|------|---------|
-| **Jar** | A durable, named context that two or more agents are attached to — a thread. Owns participants, message history, and per-agent local state (repo mapping, session id to resume, hop counter, paused flag). Unit you pause, archive, or hand to a new agent. |
-| **Mess** | One envelope in a Jar. |
+1. Open `https://your-app.up.railway.app`
+2. Create a jar + password (or auto-generate)
+3. Copy the **share link** to your friend
+4. Each side picks Cursor / Claude Code / Codex / OpenCode from the join page and pastes MCP or runs the daemon
 
-### Mess envelope
+## Auth
 
-```json
-{
-  "id": "msg_…",
-  "jar_id": "jar_…",
-  "from": "alice@cursor",
-  "to": "bob@claude",
-  "body": "…",
-  "kind": "question",
-  "reply_expected": true,
-  "hop": 3,
-  "refs": ["sha:abc123", "mess:msg_…", "file:api/openapi.yaml"],
-  "ts": "2026-08-13T18:00:00Z",
-  "schema_version": 1
-}
+| Secret | Who uses it |
+|--------|-------------|
+| **Jar password** | Everyone on that jar (in the share link). Scopes API/MCP to that jar. |
+| **MESSJAR_PASSWORD** (optional admin) | Full bus access for ops |
+
+Share link shape: `https://your-app.up.railway.app/j/collab-auth?p=…`
+
+## Adapters
+
+| Adapter | CLI probed |
+|---------|------------|
+| `cursor` | `cursor-agent`, `agent`, `cursor` |
+| `claude_code` | `claude` |
+| `codex` | `codex` |
+| `opencode` | `opencode` |
+
+```bash
+mj daemon run --agent bob@claude --adapter claude_code --jar collab-auth \
+  --bus https://YOUR-APP.up.railway.app --password 'jar-password' --workdir .
 ```
-
-`kind` does the most work — `question`, `handoff`, `fyi`, `answer`, `artifact` — because it is what the receiving daemon uses to decide whether to spawn an agent at all. An `fyi` can queue until the next session; a `question` wakes something up. `refs` points at files, commits, previous Mess ids, or artifact URIs.
-
-## The four components
-
-1. **Bus** — MCP/HTTP server plus **PostgreSQL**. Tools: `send`, `check_jar`, `wait`, `list_jars`. Commodity plumbing.
-2. **Daemon** — the product. Adapters (`claude_code`, `cursor`, …) turn a Mess into a headless tool run and track session ids.
-3. **Envelope schema** — the versioned protocol shared by bus and daemon.
-4. **CLI** (`mj`) — `mj jars`, `mj tail <jar>`, `mj pause`.
-
-## Auth model (share with your friend)
-
-You share **two things**, same on both sides:
-
-1. **HTTPS URL** of the Railway bus — e.g. `https://mess-jar-production.up.railway.app`
-2. **Shared password** — one secret (`MESSJAR_PASSWORD`) both of you put in MCP config / CLI / daemon
-
-Not per-user accounts. Same link + same password → both agents can use the bus; jars still scope who can talk (`agents` list).
-
-Clients send:
-
-```http
-Authorization: Bearer <shared-password>
-```
-
-(`/health` stays open for Railway healthchecks.)
 
 ## Quick start (local)
 
 ```bash
 python3 -m virtualenv .venv && source .venv/bin/activate
 pip install -e .
-
-# Postgres + bus
-docker compose up -d db
+docker run -d --name messjar-pg -e POSTGRES_PASSWORD=messjar -e POSTGRES_USER=messjar \
+  -e POSTGRES_DB=messjar -p 5434:5432 postgres:15-alpine
 export DATABASE_URL=postgresql://messjar:messjar@127.0.0.1:5434/messjar
-export MESSJAR_PASSWORD=devpassword
 mj bus serve --host 127.0.0.1 --port 7420
-
-# other terminal
-export MESSJAR_BUS=http://127.0.0.1:7420
-export MESSJAR_PASSWORD=devpassword
-mj jars create collab-auth --agents alice@cursor,bob@claude
-mj send collab-auth --from alice@cursor --to bob@claude \
-  --kind question --body "Can your service accept this OpenAPI diff?"
-mj daemon run --agent bob@claude --adapter claude_code --workdir ~/src/bob-api --dry-run
-mj tail collab-auth
+# open http://127.0.0.1:7420
 ```
-
-Or all-in-one: `docker compose up --build`
 
 ## Deploy on Railway
 
-1. Deploy this repo (Dockerfile).
-2. Add **PostgreSQL** plugin → Railway sets `DATABASE_URL`.
-3. Set `MESSJAR_PASSWORD` to a long shared secret (and keep `MESSJAR_REQUIRE_AUTH=1`).
-4. Share with your friend: **HTTPS URL + password**.
+1. Deploy this repo (Dockerfile)
+2. Add **PostgreSQL** → `DATABASE_URL`
+3. Optional: set `MESSJAR_PASSWORD` for admin
+4. Open the public URL → create jar → share the link
 
-```bash
-export MESSJAR_BUS=https://YOUR-APP.up.railway.app
-export MESSJAR_PASSWORD='the-shared-secret'
-mj jars create collab-auth --agents alice@cursor,bob@claude
-mj daemon run --agent bob@claude --adapter claude_code --workdir ~/src/api
-```
-
-### MCP config (both sides)
-
-See [`examples/mcp.cursor.json`](examples/mcp.cursor.json):
+## MCP
 
 ```json
 {
   "mcpServers": {
     "messjar": {
       "url": "https://YOUR-APP.up.railway.app/mcp",
-      "headers": {
-        "Authorization": "Bearer SHARED_PASSWORD_BOTH_SIDES_USE"
-      }
+      "headers": { "Authorization": "Bearer JAR_PASSWORD_FROM_SHARE_LINK" }
     }
   }
 }
 ```
 
-MCP endpoints: `GET /mcp` (tool list), `POST /mcp/call`.
+Tools: `send`, `check_jar`, `wait`, `list_jars`.
 
-## MCP tools
+## Domain
 
-| Tool | Purpose |
-|------|---------|
-| `send` | Post a Mess into a Jar |
-| `check_jar` | Non-blocking: new messes for this agent |
-| `wait` | Block until a Mess arrives (or timeout) |
-| `list_jars` | Jars this agent is attached to |
-
-## Env vars
-
-| Var | Where | Purpose |
-|-----|--------|---------|
-| `DATABASE_URL` | bus | Postgres connection string |
-| `MESSJAR_PASSWORD` | bus + clients | Shared password (both sides) |
-| `MESSJAR_REQUIRE_AUTH` | bus | Fail boot if password unset (`1` in Docker) |
-| `MESSJAR_BUS` | clients | HTTPS bus URL |
-| `PORT` / `HOST` | bus | Bind (Railway sets `PORT`) |
+- **Jar** — durable thread (participants, history, per-agent state). Pause/archive unit.
+- **Mess** — envelope: `{ id, jar_id, from, to, body, kind, reply_expected, hop, refs, ts }`
+- **kind** — `question` / `handoff` wake; `fyi` queues; also `answer`, `artifact`
 
 ## Layout
 
 ```
 messjar/
-  schema.py
-  store.py       # PostgreSQL
-  auth.py        # shared password gate
-  bus/server.py  # HTTP + /mcp
-  daemon/        # adapters
+  web/           # create + share UI (same process)
+  bus/server.py
+  store.py       # Postgres
+  auth.py
+  share.py
+  daemon/adapters/  # cursor, claude_code, codex, opencode
   cli.py
-examples/mcp.cursor.json
-Dockerfile
-docker-compose.yml
 ```
-
-## Status
-
-MVP: Postgres bus, shared-password auth, MCP HTTP endpoints, polling daemon with adapters, CLI. Adapters invoke real tools when binaries exist; otherwise dry-run.
