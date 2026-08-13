@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "messjar"
+version = "0.1.0"
+description = "Peer-to-peer async message bus for coding agents owned by different humans"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.0",
+  "typer>=0.12.0",
+  "rich>=13.0",
+]
+
+[project.scripts]
+mj = "messjar.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["messjar"]
