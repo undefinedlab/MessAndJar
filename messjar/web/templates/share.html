@@ -50,6 +50,60 @@
     </section>
 
     <section class="panel reveal" style="margin-top:1rem">
+      <h2>Label</h2>
+      <p class="hint">Persistent agreed context — read by every spawn, survives independently of message history.</p>
+      <pre class="mono" id="label-block">{{ label or '(no label set yet)' }}</pre>
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
+      <h2>Pending proposals <span class="count">{{ pending_proposals|length }}</span></h2>
+      <div id="proposal-list">
+        {% if pending_proposals %}
+        {% for p in pending_proposals %}
+        <article class="proposal-card" data-proposal-id="{{ p.id }}">
+          <header>
+            <span class="who">{{ p.proposed_by }}</span>
+            <span class="when">{{ p.created_at }}</span>
+          </header>
+          {% if p.origin_mess %}
+          <div class="mess-row">
+            <header>
+              <span class="kind">origin: {{ p.origin_mess.kind }}</span>
+              <span class="who">{{ p.origin_mess.from }} → {{ p.origin_mess.to }}</span>
+            </header>
+            <pre>{{ p.origin_mess.body }}</pre>
+          </div>
+          {% endif %}
+          <pre class="mono diff-block">{{ p.diff or '(empty diff)' }}</pre>
+          <p class="hint">accepted by: {{ p.accepted_by|join(', ') or '(none yet)' }} — needs all of: {{ agents|join(', ') }}</p>
+          <label>Acting as</label>
+          <select class="proposal-agent">
+            {% for a in agents %}
+            <option value="{{ a }}">{{ a }}</option>
+            {% endfor %}
+          </select>
+          <div class="actions">
+            <button type="button" class="proposal-accept">Accept</button>
+            <button type="button" class="danger proposal-reject">Reject</button>
+            <button type="button" class="secondary proposal-edit-toggle">Edit &amp; accept</button>
+          </div>
+          <div class="proposal-edit-form hidden">
+            <label>Edit proposed text</label>
+            <textarea class="proposal-edit-body">{{ p.patch }}</textarea>
+            <div class="actions">
+              <button type="button" class="proposal-edit-submit">Save &amp; accept</button>
+            </div>
+          </div>
+          <p class="error hidden proposal-err"></p>
+        </article>
+        {% endfor %}
+        {% else %}
+        <p class="hint">No pending proposals.</p>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="panel reveal" style="margin-top:1rem">
       <h2>Repos keys</h2>
       <p class="hint">Used so one MCP connection can pick this jar from the project folder / git remote.</p>
       <ul class="chip-list" id="repo-list">
@@ -223,6 +277,94 @@
           err.textContent = e.message || String(e);
           err.classList.remove('hidden');
         }
+      });
+    }
+
+    const proposalList = document.getElementById('proposal-list');
+    if (proposalList && meta) {
+      const cardOf = (el) => el.closest('.proposal-card');
+      const agentOf = (card) => card.querySelector('.proposal-agent').value;
+      const errOf = (card) => card.querySelector('.proposal-err');
+
+      async function decide(card, decision) {
+        const err = errOf(card);
+        err.classList.add('hidden');
+        try {
+          const res = await fetch('/api/jars/label/decide', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jar: meta.jar,
+              password: meta.password,
+              proposal_id: card.dataset.proposalId,
+              agent: agentOf(card),
+              decision,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'decide failed');
+          onDecided(card, data);
+        } catch (e) {
+          err.textContent = e.message || String(e);
+          err.classList.remove('hidden');
+        }
+      }
+
+      async function editAndAccept(card) {
+        const err = errOf(card);
+        err.classList.add('hidden');
+        const patch = card.querySelector('.proposal-edit-body').value;
+        try {
+          const res = await fetch('/api/jars/label/edit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jar: meta.jar,
+              password: meta.password,
+              proposal_id: card.dataset.proposalId,
+              agent: agentOf(card),
+              patch,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || 'edit failed');
+          onDecided(card, data);
+        } catch (e) {
+          err.textContent = e.message || String(e);
+          err.classList.remove('hidden');
+        }
+      }
+
+      function onDecided(card, proposal) {
+        if (proposal.status === 'applied') {
+          document.getElementById('label-block').textContent = proposal.patch;
+          card.remove();
+        } else if (proposal.status === 'rejected') {
+          card.remove();
+        } else {
+          // still pending — reflect the new accepted_by / diff / patch in place
+          const hint = card.querySelector('.hint');
+          if (hint) {
+            hint.textContent = `accepted by: ${(proposal.accepted_by || []).join(', ') || '(none yet)'}`;
+          }
+          const diffBlock = card.querySelector('.diff-block');
+          if (diffBlock) diffBlock.textContent = proposal.diff || '(empty diff)';
+          const editBody = card.querySelector('.proposal-edit-body');
+          if (editBody) editBody.value = proposal.patch;
+          card.querySelector('.proposal-edit-form').classList.add('hidden');
+        }
+      }
+
+      proposalList.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        const card = cardOf(target);
+        if (!card) return;
+        if (target.classList.contains('proposal-accept')) decide(card, 'accept');
+        else if (target.classList.contains('proposal-reject')) decide(card, 'reject');
+        else if (target.classList.contains('proposal-edit-toggle')) {
+          card.querySelector('.proposal-edit-form').classList.toggle('hidden');
+        } else if (target.classList.contains('proposal-edit-submit')) editAndAccept(card);
       });
     }
   </script>

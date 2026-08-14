@@ -110,6 +110,41 @@ class BusClient:
         r.raise_for_status()
         return r.json()
 
+    def propose_label(
+        self, jar: str, *, agent: str, patch: str, origin_mess_id: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"agent": agent, "patch": patch}
+        if origin_mess_id is not None:
+            payload["origin_mess_id"] = origin_mess_id
+        r = self._client.post(f"/jars/{jar}/label/propose", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def list_label_proposals(self, jar: str, *, status: str = "pending") -> list[dict[str, Any]]:
+        r = self._client.get(f"/jars/{jar}/label/proposals", params={"status": status})
+        r.raise_for_status()
+        return r.json()
+
+    def decide_label_proposal(
+        self, jar: str, proposal_id: str, *, agent: str, decision: str
+    ) -> dict[str, Any]:
+        r = self._client.post(
+            f"/jars/{jar}/label/proposals/{proposal_id}/decide",
+            json={"agent": agent, "decision": decision},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def edit_label_proposal(
+        self, jar: str, proposal_id: str, *, agent: str, patch: str
+    ) -> dict[str, Any]:
+        r = self._client.post(
+            f"/jars/{jar}/label/proposals/{proposal_id}/edit",
+            json={"agent": agent, "patch": patch},
+        )
+        r.raise_for_status()
+        return r.json()
+
     def mcp_call(self, name: str, arguments: dict[str, Any]) -> Any:
         r = self._client.post("/rpc/call", json={"name": name, "arguments": arguments})
         r.raise_for_status()

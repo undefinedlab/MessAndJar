@@ -23,9 +23,11 @@ app = typer.Typer(
 jars_app = typer.Typer(help="Manage jars")
 bus_app = typer.Typer(help="Run the bus")
 daemon_app = typer.Typer(help="Run a local agent daemon")
+label_app = typer.Typer(help="Propose and review changes to a jar's label")
 app.add_typer(jars_app, name="jars")
 app.add_typer(bus_app, name="bus")
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(label_app, name="label")
 
 console = Console()
 DEFAULT_BUS = os.environ.get("MESSJAR_BUS", "http://127.0.0.1:7420")
@@ -224,6 +226,110 @@ def resume_jar(
     with _client(bus, password) as c:
         j = c.resume(jar)
     console.print(f"resumed [cyan]{j['name']}[/]")
+
+
+def _read_body(body: Optional[str], body_file: Optional[Path]) -> str:
+    if body is not None:
+        return body
+    if body_file is not None:
+        return body_file.read_text()
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise typer.BadParameter("provide --body, --body-file, or stdin")
+
+
+@label_app.command("show")
+def label_show(
+    jar: str = typer.Argument(...),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        j = c.get_jar(jar)
+    label = j.get("label")
+    if label:
+        console.print(label, markup=False)
+    else:
+        console.print("[dim](no label set)[/]")
+
+
+@label_app.command("propose")
+def label_propose(
+    jar: str = typer.Argument(...),
+    agent: str = typer.Option(..., "--agent"),
+    body: Optional[str] = typer.Option(None, "--body"),
+    body_file: Optional[Path] = typer.Option(None, "--body-file"),
+    origin_mess: Optional[str] = typer.Option(None, "--origin-mess"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    """Propose new label text. Takes effect only once every participant accepts."""
+    patch = _read_body(body, body_file)
+    with _client(bus, password) as c:
+        proposal = c.propose_label(jar, agent=agent, patch=patch, origin_mess_id=origin_mess)
+    console.print(f"proposed [cyan]{proposal['id']}[/] on {jar} — awaiting acceptance from all participants")
+
+
+@label_app.command("list")
+def label_list(
+    jar: str = typer.Argument(...),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        proposals = c.list_label_proposals(jar, status="pending")
+    if not proposals:
+        console.print("[dim]no pending proposals[/]")
+        return
+    for p in proposals:
+        console.print(
+            f"[cyan]{p['id']}[/] by {p['proposed_by']} — accepted by: {', '.join(p['accepted_by']) or '(none)'}"
+        )
+        console.print(p["diff"] or "(empty diff)", markup=False)
+        console.print()
+
+
+@label_app.command("accept")
+def label_accept(
+    jar: str = typer.Argument(...),
+    proposal_id: str = typer.Argument(...),
+    agent: str = typer.Option(..., "--agent"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        p = c.decide_label_proposal(jar, proposal_id, agent=agent, decision="accept")
+    console.print(f"[cyan]{p['id']}[/] status={p['status']} accepted_by={p['accepted_by']}")
+
+
+@label_app.command("reject")
+def label_reject(
+    jar: str = typer.Argument(...),
+    proposal_id: str = typer.Argument(...),
+    agent: str = typer.Option(..., "--agent"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        p = c.decide_label_proposal(jar, proposal_id, agent=agent, decision="reject")
+    console.print(f"[cyan]{p['id']}[/] status={p['status']}")
+
+
+@label_app.command("edit")
+def label_edit(
+    jar: str = typer.Argument(...),
+    proposal_id: str = typer.Argument(...),
+    agent: str = typer.Option(..., "--agent"),
+    body: Optional[str] = typer.Option(None, "--body"),
+    body_file: Optional[Path] = typer.Option(None, "--body-file"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    """Replace the proposed text and accept it — resets everyone else's prior accept."""
+    patch = _read_body(body, body_file)
+    with _client(bus, password) as c:
+        p = c.edit_label_proposal(jar, proposal_id, agent=agent, patch=patch)
+    console.print(f"[cyan]{p['id']}[/] edited + accepted by {agent}; status={p['status']}")
 
 
 @daemon_app.command("run")

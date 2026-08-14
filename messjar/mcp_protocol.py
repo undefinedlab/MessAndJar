@@ -146,6 +146,33 @@ def build_mcp() -> FastMCP:
         return store.send(mess).model_dump(by_alias=True)
 
     @mcp.tool
+    def update_label(
+        patch: str,
+        jar: str | None = None,
+        repo: str | None = None,
+        workdir: str | None = None,
+        agent: str | None = None,
+        origin_mess_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Propose a change to the jar's label (persistent shared context).
+
+        Does NOT write immediately — creates a pending proposal. It only
+        takes effect once every participant on the jar accepts it, via the
+        web UI or `mj label accept` (there is deliberately no MCP tool for
+        accept/reject/edit — that's the human-confirmation checkpoint).
+        """
+        auth = get_auth()
+        store = get_store()
+        j = _pick_jar(auth, agent=agent, jar=jar, repo=repo, workdir=workdir)
+        proposed_by = agent or auth.agent_id
+        if not proposed_by:
+            raise PermissionError("update_label requires an agent id")
+        proposal = store.propose_label(
+            j.id, proposed_by=proposed_by, patch=patch, origin_mess_id=origin_mess_id
+        )
+        return proposal.model_dump()
+
+    @mcp.tool
     def check_jar(
         agent: str,
         jar: str | None = None,

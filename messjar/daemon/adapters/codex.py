@@ -22,9 +22,10 @@ class CodexAdapter(Adapter):
         session_id: str | None,
         dry_run: bool = False,
         readonly: bool = False,
+        label: str | None = None,
     ) -> InvokeResult:
         binary = self.binary(["codex"])
-        prompt = build_prompt(mess)
+        prompt = build_prompt(mess, label=label)
         # `codex exec` is the non-interactive path in recent CLIs
         mode_flags = ["--sandbox", "read-only"] if readonly else ["--full-auto"]
         cmd = [binary or "codex", "exec", *mode_flags, prompt]
