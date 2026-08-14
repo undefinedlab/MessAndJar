@@ -15,10 +15,13 @@ from psycopg_pool import ConnectionPool
 
 from messjar.schema import (
     DEFAULT_CIRCUIT,
+    DEFAULT_POLICY,
+    HELD_TIMEOUT_S,
     LABEL_MAX_BYTES,
     LOOP_TIMEOUT_S,
     WAKE_KINDS,
     AgentLocalState,
+    HeldMessage,
     Jar,
     LabelProposal,
     Mess,
@@ -188,6 +191,44 @@ class Store:
                 ALTER TABLE messes ADD COLUMN IF NOT EXISTS loop_id TEXT;
                 ALTER TABLE messes ADD COLUMN IF NOT EXISTS loop_state TEXT;
                 CREATE INDEX IF NOT EXISTS idx_messes_loop ON messes (jar_id, loop_state);
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS policy_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+                CREATE TABLE IF NOT EXISTS held_messages (
+                    id TEXT PRIMARY KEY,
+                    jar_id TEXT NOT NULL REFERENCES jars(id),
+                    from_agent TEXT NOT NULL,
+                    to_agent TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    reply_expected BOOLEAN NOT NULL,
+                    hop INTEGER NOT NULL,
+                    refs_json JSONB NOT NULL,
+                    trigger_source TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'held',
+                    created_at TIMESTAMPTZ NOT NULL,
+                    held_until TIMESTAMPTZ NOT NULL,
+                    approved_by TEXT,
+                    decided_at TIMESTAMPTZ,
+                    sent_mess_id TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS audit (
+                    id TEXT PRIMARY KEY,
+                    jar_id TEXT NOT NULL,
+                    actor TEXT,
+                    action TEXT NOT NULL,
+                    target_id TEXT,
+                    detail TEXT,
+                    ts TIMESTAMPTZ NOT NULL,
+                    client TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_held_messages_jar ON held_messages (jar_id, status);
+                CREATE INDEX IF NOT EXISTS idx_audit_jar ON audit (jar_id, ts);
                 """
             )
             conn.commit()
@@ -373,6 +414,25 @@ class Store:
             )
             conn.commit()
         jar.circuit = merged
+        return jar
+
+    def set_jar_policy(self, jar_id_or_name: str, cfg: dict[str, Any]) -> Jar:
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        merged = dict(jar.policy)
+        if "held_kinds" in cfg and cfg["held_kinds"] is not None:
+            held_kinds = list(cfg["held_kinds"])
+            for k in held_kinds:
+                MessKind(k)  # validates it's a real kind, raises ValueError otherwise
+            merged["held_kinds"] = held_kinds
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE jars SET policy_json = %s::jsonb WHERE id = %s",
+                (json.dumps(merged), jar.id),
+            )
+            conn.commit()
+        jar.policy = merged
         return jar
 
     def update_agent_local(self, jar_id: str, state: AgentLocalState) -> Jar:
@@ -591,6 +651,9 @@ class Store:
                             "UPDATE label_proposals SET status = 'applied', decided_at = %s WHERE id = %s",
                             (now, proposal.id),
                         )
+        self.write_audit(
+            jar.id, actor=participant, action=f"label_{decision}ed", target_id=proposal.id, client=client
+        )
         return self.get_label_proposal(proposal.id)  # type: ignore[return-value]
 
     def edit_label_proposal(
@@ -726,6 +789,149 @@ class Store:
         if trip_reason is not None:
             raise CircuitBreakerTripped(f"circuit breaker tripped on jar {jar.name}: {trip_reason}")
         return mess
+
+    def hold_message(self, mess: Mess) -> HeldMessage:
+        """Queue a Held-tier Mess for the sender's human. Lives entirely
+        outside `messes` — see HeldMessage's docstring for why. No circuit-
+        breaker check here (that only applies at approval time, via the
+        unmodified send() call approve_held_message() makes)."""
+        held = HeldMessage.create(
+            jar_id=mess.jar_id,
+            from_agent=mess.from_agent,
+            to_agent=mess.to_agent,
+            body=mess.body,
+            kind=mess.kind,
+            reply_expected=mess.reply_expected,
+            hop=mess.hop,
+            refs=mess.refs,
+            trigger_source=mess.trigger_source,
+        )
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO held_messages (
+                    id, jar_id, from_agent, to_agent, body, kind, reply_expected,
+                    hop, refs_json, trigger_source, status, created_at, held_until
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+                """,
+                (
+                    held.id, held.jar_id, held.from_agent, held.to_agent, held.body,
+                    held.kind.value, held.reply_expected, held.hop, json.dumps(held.refs),
+                    held.trigger_source, held.status, held.created_at, held.held_until,
+                ),
+            )
+            conn.commit()
+        return held
+
+    def list_held_messages(
+        self, jar_id_or_name: str, *, from_agent: str | None = None
+    ) -> list[HeldMessage]:
+        """Held items for a jar, sender's-human-review queue. Lazily drops
+        anything past held_until first — fail closed on timeout, never
+        auto-sent, matching the brief's hard constraint verbatim."""
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE held_messages SET status = 'dropped' "
+                "WHERE jar_id = %s AND status = 'held' AND held_until < now()",
+                (jar.id,),
+            )
+            conn.commit()
+            q = "SELECT * FROM held_messages WHERE jar_id = %s AND status = 'held'"
+            params: list[Any] = [jar.id]
+            if from_agent:
+                q += " AND from_agent = %s"
+                params.append(from_agent)
+            q += " ORDER BY created_at ASC"
+            rows = conn.execute(q, params).fetchall()
+        return [self._row_to_held(r) for r in rows]
+
+    def get_held_message(self, held_id: str) -> HeldMessage | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM held_messages WHERE id = %s", (held_id,)
+            ).fetchone()
+        return self._row_to_held(row) if row else None
+
+    def approve_held_message(
+        self, held_id: str, *, approved_by: str, client: str | None = None
+    ) -> Mess:
+        held = self.get_held_message(held_id)
+        if not held:
+            raise KeyError(f"held message not found: {held_id}")
+        if held.status != "held":
+            raise ValueError(f"held message {held_id} is already {held.status}")
+        mess = Mess.create(
+            jar_id=held.jar_id,
+            from_agent=held.from_agent,
+            to_agent=held.to_agent,
+            body=held.body,
+            kind=held.kind,
+            reply_expected=held.reply_expected,
+            hop=held.hop,
+            refs=held.refs,
+            trigger_source=held.trigger_source,
+        )
+        sent = self.send(mess)  # unmodified — full circuit-breaker + loop-tracking reuse
+        now = _now_iso()
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE held_messages SET status = 'sent', approved_by = %s, "
+                "decided_at = %s, sent_mess_id = %s WHERE id = %s",
+                (approved_by, now, sent.id, held.id),
+            )
+            conn.commit()
+        self.write_audit(
+            held.jar_id, actor=approved_by, action="held_approved", target_id=held.id,
+            detail=f"sent_mess_id={sent.id}", client=client,
+        )
+        return sent
+
+    def reject_held_message(
+        self, held_id: str, *, rejected_by: str | None = None, client: str | None = None
+    ) -> HeldMessage:
+        held = self.get_held_message(held_id)
+        if not held:
+            raise KeyError(f"held message not found: {held_id}")
+        if held.status != "held":
+            raise ValueError(f"held message {held_id} is already {held.status}")
+        now = _now_iso()
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE held_messages SET status = 'dropped', decided_at = %s WHERE id = %s",
+                (now, held.id),
+            )
+            conn.commit()
+        self.write_audit(
+            held.jar_id, actor=rejected_by, action="held_rejected", target_id=held.id, client=client
+        )
+        held.status = "dropped"
+        held.decided_at = now
+        return held
+
+    def write_audit(
+        self,
+        jar_id: str,
+        *,
+        actor: str | None,
+        action: str,
+        target_id: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        """Append-only. Never updated, never deleted — no method in this
+        class does either to a row in this table."""
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit (id, jar_id, actor, action, target_id, detail, ts, client)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (f"aud_{uuid.uuid4().hex[:12]}", jar_id, actor, action, target_id, detail, _now_iso(), client),
+            )
+            conn.commit()
 
     def list_messes(
         self,
@@ -889,6 +1095,7 @@ class Store:
             paused_reason=row.get("paused_reason"),
             circuit=dict(self._as_json(row.get("circuit_json") or {})) or dict(DEFAULT_CIRCUIT),
             label=row.get("label"),
+            policy=dict(self._as_json(row.get("policy_json") or {})) or dict(DEFAULT_POLICY),
         )
 
     def _row_to_mess(self, row: dict[str, Any]) -> Mess:
@@ -927,6 +1134,31 @@ class Store:
             status=row["status"],
             created_at=_ts(row["created_at"]),  # type: ignore[arg-type]
             decided_at=_ts(row.get("decided_at")),
+        )
+
+    def _row_to_held(self, row: dict[str, Any]) -> HeldMessage:
+        def _ts(value: Any) -> str | None:
+            if value is None:
+                return None
+            return value if isinstance(value, str) else value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        return HeldMessage(
+            id=row["id"],
+            jar_id=row["jar_id"],
+            from_agent=row["from_agent"],
+            to_agent=row["to_agent"],
+            body=row["body"],
+            kind=MessKind(row["kind"]),
+            reply_expected=bool(row["reply_expected"]),
+            hop=row["hop"],
+            refs=list(self._as_json(row["refs_json"])),
+            trigger_source=row.get("trigger_source") or "agent",
+            status=row["status"],
+            created_at=_ts(row["created_at"]),  # type: ignore[arg-type]
+            held_until=_ts(row["held_until"]),  # type: ignore[arg-type]
+            approved_by=row.get("approved_by"),
+            decided_at=_ts(row.get("decided_at")),
+            sent_mess_id=row.get("sent_mess_id"),
         )
 
 

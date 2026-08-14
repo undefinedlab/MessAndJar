@@ -24,10 +24,12 @@ jars_app = typer.Typer(help="Manage jars")
 bus_app = typer.Typer(help="Run the bus")
 daemon_app = typer.Typer(help="Run a local agent daemon")
 label_app = typer.Typer(help="Propose and review changes to a jar's label")
+held_app = typer.Typer(help="Review handoff/artifact messages held for your approval")
 app.add_typer(jars_app, name="jars")
 app.add_typer(bus_app, name="bus")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(label_app, name="label")
+app.add_typer(held_app, name="held")
 
 console = Console()
 DEFAULT_BUS = os.environ.get("MESSJAR_BUS", "http://127.0.0.1:7420")
@@ -115,6 +117,10 @@ def send_mess(
     body_file: Optional[Path] = typer.Option(None, "--body-file"),
     hop: int = typer.Option(0, "--hop"),
     refs: Optional[str] = typer.Option(None, "--refs", help="Comma-separated refs"),
+    trigger_source: str = typer.Option(
+        "human", "--trigger-source", help="human (default) or agent — agent-triggered "
+        "handoff/artifact gets held for the sender's human, per the jar's policy"
+    ),
     bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
     password: Optional[str] = typer.Option(
         None, "--password", "-p", envvar="MESSJAR_PASSWORD"
@@ -139,10 +145,17 @@ def send_mess(
             kind=kind,
             hop=hop,
             refs=ref_list,
+            trigger_source=trigger_source,
         )
-    console.print(
-        f"sent [green]{mess['id']}[/] kind={mess['kind']} seq={mess.get('seq')} → {mess['to']}"
-    )
+    if mess.get("status") == "held":
+        console.print(
+            f"held [yellow]{mess['id']}[/] kind={mess['kind']} → {mess['to_agent']} "
+            f"— queued for the sender's human, review with `mj held list {jar}`"
+        )
+    else:
+        console.print(
+            f"sent [green]{mess['id']}[/] kind={mess['kind']} seq={mess.get('seq')} → {mess['to']}"
+        )
 
 
 @app.command("tail")
@@ -399,6 +412,57 @@ def label_edit(
     with _client(bus, password) as c:
         p = c.edit_label_proposal(jar, proposal_id, agent=agent, patch=patch)
     console.print(f"[cyan]{p['id']}[/] edited + accepted by {agent}; status={p['status']}")
+
+
+@held_app.command("list")
+def held_list(
+    jar: str = typer.Argument(...),
+    agent: Optional[str] = typer.Option(
+        None, "--agent", help="Only messages held from this sender"
+    ),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        held = c.list_held(jar, from_agent=agent)
+    if not held:
+        console.print("[dim]nothing held[/]")
+        return
+    for h in held:
+        console.print(
+            f"[cyan]{h['id']}[/] {h['kind']} {h['from_agent']} → {h['to_agent']} "
+            f"(held until {h['held_until']})"
+        )
+        console.print(h["body"], markup=False)
+        if h.get("refs"):
+            console.print(f"  refs: {', '.join(h['refs'])}", style="dim")
+        console.print()
+
+
+@held_app.command("approve")
+def held_approve(
+    jar: str = typer.Argument(...),
+    held_id: str = typer.Argument(...),
+    agent: str = typer.Option(..., "--agent", help="Who is approving this"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        mess = c.approve_held(jar, held_id, approved_by=agent)
+    console.print(f"approved [cyan]{held_id}[/] → sent as [green]{mess['id']}[/] seq={mess.get('seq')}")
+
+
+@held_app.command("reject")
+def held_reject(
+    jar: str = typer.Argument(...),
+    held_id: str = typer.Argument(...),
+    agent: Optional[str] = typer.Option(None, "--agent"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    with _client(bus, password) as c:
+        h = c.reject_held(jar, held_id, rejected_by=agent)
+    console.print(f"[cyan]{held_id}[/] status={h['status']}")
 
 
 @daemon_app.command("run")
