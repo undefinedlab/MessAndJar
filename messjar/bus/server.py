@@ -22,7 +22,7 @@ from messjar.auth import (
 )
 from messjar.mcp_auth_asgi import mcp_auth_middleware
 from messjar.mcp_protocol import build_mcp
-from messjar.schema import AgentLocalState, Jar, Mess, MessKind
+from messjar.schema import AgentLocalState, Jar, LabelProposal, Mess, MessKind, label_diff
 from messjar.share import agent_mcp_bundle, connection_bundle
 from messjar.store import CircuitBreakerTripped, Store, database_host_label, normalize_database_url
 
@@ -100,6 +100,15 @@ class ListJarsBody(BaseModel):
     include_archived: bool = False
 
 
+class UpdateLabelBody(BaseModel):
+    patch: str
+    jar: str | None = None
+    repo: str | None = None
+    workdir: str | None = None
+    agent: str | None = None
+    origin_mess_id: str | None = None
+
+
 class AckBody(BaseModel):
     jar: str
     agent: str
@@ -120,6 +129,46 @@ class CircuitConfigBody(BaseModel):
     max_spawns: int | None = None
     window_s: int | None = None
     max_hop_depth: int | None = None
+
+
+class LabelProposeBody(BaseModel):
+    agent: str
+    patch: str
+    origin_mess_id: str | None = None
+
+
+class LabelDecideBody(BaseModel):
+    agent: str
+    decision: str  # accept | reject
+
+
+class LabelEditBody(BaseModel):
+    agent: str
+    patch: str
+
+
+class PublicLabelProposeBody(BaseModel):
+    jar: str
+    password: str
+    agent: str
+    patch: str
+    origin_mess_id: str | None = None
+
+
+class PublicLabelDecideBody(BaseModel):
+    jar: str
+    password: str
+    proposal_id: str
+    agent: str
+    decision: str
+
+
+class PublicLabelEditBody(BaseModel):
+    jar: str
+    password: str
+    proposal_id: str
+    agent: str
+    patch: str
 
 
 def _request_base(request: Request) -> str:
@@ -249,6 +298,9 @@ def create_app(store: Store) -> FastAPI:
         ]
         # show newest first in UI
         recent = list(reversed(recent[-15:]))
+        pending_proposals = [
+            _proposal_public_dict(store, p) for p in store.list_label_proposals(jar.id, status="pending")
+        ]
         return templates.TemplateResponse(
             request,
             "share.html",
@@ -259,6 +311,8 @@ def create_app(store: Store) -> FastAPI:
                 "created_at": jar.created_at,
                 "paused": jar.paused,
                 "recent": recent,
+                "label": jar.label,
+                "pending_proposals": pending_proposals,
             },
         )
 
@@ -291,6 +345,53 @@ def create_app(store: Store) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
         return {"jar": jar.name, "repos": jar.repos, "agents": jar.agents}
+
+    def _public_jar_or_401(jar_name: str, password: str) -> Jar:
+        jar = store.get_jar(jar_name)
+        if not jar or not jar.password or not passwords_match(password, jar.password):
+            raise HTTPException(401, "bad jar password")
+        return jar
+
+    @app.post("/api/jars/label/propose")
+    def public_propose_label(body: PublicLabelProposeBody) -> dict[str, Any]:
+        jar = _public_jar_or_401(body.jar, body.password)
+        try:
+            proposal = store.propose_label(
+                jar.id, proposed_by=body.agent, patch=body.patch, origin_mess_id=body.origin_mess_id
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
+
+    @app.get("/api/jars/label/proposals")
+    def public_list_label_proposals(
+        jar: str, p: str = Query(...), status: str = "pending"
+    ) -> list[dict[str, Any]]:
+        found = _public_jar_or_401(jar, p)
+        proposals = store.list_label_proposals(found.id, status=status or None)
+        return [_proposal_public_dict(store, prop) for prop in proposals]
+
+    @app.post("/api/jars/label/decide")
+    def public_decide_label(body: PublicLabelDecideBody) -> dict[str, Any]:
+        _public_jar_or_401(body.jar, body.password)
+        try:
+            proposal = store.decide_label_proposal(
+                body.proposal_id, participant=body.agent, decision=body.decision, client="web"
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
+
+    @app.post("/api/jars/label/edit")
+    def public_edit_label(body: PublicLabelEditBody) -> dict[str, Any]:
+        _public_jar_or_401(body.jar, body.password)
+        try:
+            proposal = store.edit_label_proposal(
+                body.proposal_id, participant=body.agent, patch=body.patch, client="web"
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
 
     @app.post("/api/jars")
     def public_create_jar(request: Request, body: CreateJarBody) -> dict[str, Any]:
@@ -434,6 +535,71 @@ def create_app(store: Store) -> FastAPI:
             return store.set_jar_circuit(jar, cfg).public_dict()
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+
+    @app.post("/jars/{jar}/label/propose")
+    def propose_label(
+        jar: str, body: LabelProposeBody, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        try:
+            proposal = store.propose_label(
+                jar, proposed_by=body.agent, patch=body.patch, origin_mess_id=body.origin_mess_id
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
+
+    @app.get("/jars/{jar}/label/proposals")
+    def list_label_proposals(
+        jar: str, status: str = "pending", auth: AuthContext = Depends(resolve_auth)
+    ) -> list[dict[str, Any]]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        proposals = store.list_label_proposals(jar, status=status or None)
+        return [_proposal_public_dict(store, p) for p in proposals]
+
+    @app.post("/jars/{jar}/label/proposals/{proposal_id}/decide")
+    def decide_label_proposal(
+        jar: str,
+        proposal_id: str,
+        body: LabelDecideBody,
+        auth: AuthContext = Depends(resolve_auth),
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        try:
+            proposal = store.decide_label_proposal(
+                proposal_id, participant=body.agent, decision=body.decision, client="cli"
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
+
+    @app.post("/jars/{jar}/label/proposals/{proposal_id}/edit")
+    def edit_label_proposal(
+        jar: str,
+        proposal_id: str,
+        body: LabelEditBody,
+        auth: AuthContext = Depends(resolve_auth),
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        try:
+            proposal = store.edit_label_proposal(
+                proposal_id, participant=body.agent, patch=body.patch, client="cli"
+            )
+        except (KeyError, PermissionError, ValueError) as e:
+            raise _label_error(e) from e
+        return _proposal_public_dict(store, proposal)
 
     @app.get("/jars/{jar}/messes")
     def jar_messes(
@@ -585,6 +751,26 @@ def create_app(store: Store) -> FastAPI:
                         },
                     },
                 },
+                {
+                    "name": "update_label",
+                    "description": (
+                        "Propose a change to the jar's label (persistent shared context). "
+                        "Creates a pending proposal; does not write until every participant "
+                        "accepts it via the web UI or `mj label accept`."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "patch": {"type": "string"},
+                            "jar": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "workdir": {"type": "string"},
+                            "agent": {"type": "string"},
+                            "origin_mess_id": {"type": "string"},
+                        },
+                        "required": ["patch"],
+                    },
+                },
             ],
         }
 
@@ -704,6 +890,29 @@ def create_app(store: Store) -> FastAPI:
                         {"type": "json", "json": [j.public_dict() for j in jars if j]}
                     ]
                 }
+            if name == "update_label":
+                body = UpdateLabelBody.model_validate(args)
+                jar = pick_jar(
+                    auth,
+                    agent=body.agent,
+                    jar=body.jar,
+                    repo=body.repo,
+                    workdir=body.workdir,
+                )
+                assert jar is not None
+                proposed_by = body.agent or auth.agent_id
+                if not proposed_by:
+                    raise HTTPException(400, "update_label requires an agent id")
+                try:
+                    proposal = store.propose_label(
+                        jar.id,
+                        proposed_by=proposed_by,
+                        patch=body.patch,
+                        origin_mess_id=body.origin_mess_id,
+                    )
+                except (KeyError, PermissionError, ValueError) as e:
+                    raise _label_error(e) from e
+                return {"content": [{"type": "json", "json": _proposal_public_dict(store, proposal)}]}
             raise HTTPException(400, f"unknown tool: {name}")
         except HTTPException:
             raise
@@ -721,6 +930,28 @@ def create_app(store: Store) -> FastAPI:
     app.mount("/", mcp_http)
 
     return app
+
+
+def _label_error(e: Exception) -> HTTPException:
+    if isinstance(e, KeyError):
+        return HTTPException(404, str(e))
+    if isinstance(e, PermissionError):
+        return HTTPException(403, str(e))
+    return HTTPException(400, str(e))
+
+
+def _proposal_public_dict(store: Store, proposal: LabelProposal) -> dict[str, Any]:
+    data = proposal.model_dump()
+    data["accepted_by"] = [
+        a["participant"] for a in store.list_approvals(proposal.id) if a["decision"] == "accept"
+    ]
+    data["diff"] = label_diff(proposal.base_label, proposal.patch)
+    data["origin_mess"] = None
+    if proposal.origin_mess_id:
+        origin = store.get_mess(proposal.origin_mess_id)
+        if origin:
+            data["origin_mess"] = origin.model_dump(by_alias=True)
+    return data
 
 
 def _send(store: Store, body: SendBody) -> dict[str, Any]:

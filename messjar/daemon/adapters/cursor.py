@@ -22,9 +22,10 @@ class CursorAdapter(Adapter):
         session_id: str | None,
         dry_run: bool = False,
         readonly: bool = False,
+        label: str | None = None,
     ) -> InvokeResult:
         binary = self.binary(["cursor-agent", "agent", "cursor"])
-        prompt = build_prompt(mess)
+        prompt = build_prompt(mess, label=label)
         # Prefer print/headless style; fall back to generic argv
         if binary and binary.endswith("cursor") and "agent" not in binary:
             cmd = [binary, "agent", "-p", prompt]

@@ -22,6 +22,7 @@ class OpenCodeAdapter(Adapter):
         session_id: str | None,
         dry_run: bool = False,
         readonly: bool = False,
+        label: str | None = None,
     ) -> InvokeResult:
         if readonly:
             # OpenCode has no documented read-only/plan CLI mode. The daemon
@@ -33,7 +34,7 @@ class OpenCodeAdapter(Adapter):
                 "opencode read-only spawns are unsupported; caller must skip before invoking"
             )
         binary = self.binary(["opencode"])
-        prompt = build_prompt(mess)
+        prompt = build_prompt(mess, label=label)
         cmd = [binary or "opencode", "run", prompt]
         if session_id:
             cmd.extend(["--session", session_id])

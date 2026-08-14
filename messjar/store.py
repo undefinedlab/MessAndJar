@@ -5,13 +5,24 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from messjar.schema import DEFAULT_CIRCUIT, WAKE_KINDS, AgentLocalState, Jar, Mess, MessKind
+from messjar.schema import (
+    DEFAULT_CIRCUIT,
+    LABEL_MAX_BYTES,
+    WAKE_KINDS,
+    AgentLocalState,
+    Jar,
+    LabelProposal,
+    Mess,
+    MessKind,
+)
+from messjar.schema import _now as _now_iso
 
 
 def normalize_database_url(url: str) -> str:
@@ -137,6 +148,37 @@ class Store:
                 ALTER TABLE jars ADD COLUMN IF NOT EXISTS circuit_json JSONB NOT NULL DEFAULT '{}'::jsonb;
                 ALTER TABLE jars ADD COLUMN IF NOT EXISTS circuit_state_json JSONB NOT NULL DEFAULT '{}'::jsonb;
                 ALTER TABLE messes ADD COLUMN IF NOT EXISTS trigger_source TEXT NOT NULL DEFAULT 'human';
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS label TEXT;
+
+                CREATE TABLE IF NOT EXISTS label_proposals (
+                    id TEXT PRIMARY KEY,
+                    jar_id TEXT NOT NULL REFERENCES jars(id),
+                    proposed_by TEXT NOT NULL,
+                    base_label TEXT,
+                    patch TEXT NOT NULL,
+                    origin_mess_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL,
+                    decided_at TIMESTAMPTZ
+                );
+
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id TEXT PRIMARY KEY,
+                    proposal_id TEXT NOT NULL REFERENCES label_proposals(id),
+                    jar_id TEXT NOT NULL,
+                    participant TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    ts TIMESTAMPTZ NOT NULL,
+                    client TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_label_proposals_jar ON label_proposals (jar_id, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_proposal_participant
+                    ON approvals (proposal_id, participant);
                 """
             )
             conn.commit()
@@ -383,6 +425,198 @@ class Store:
                 conn.commit()
         return jar
 
+    def get_mess(self, mess_id: str) -> Mess | None:
+        with self._pool.connection() as conn:
+            row = conn.execute("SELECT * FROM messes WHERE id = %s", (mess_id,)).fetchone()
+        return self._row_to_mess(row) if row else None
+
+    def propose_label(
+        self,
+        jar_id_or_name: str,
+        *,
+        proposed_by: str,
+        patch: str,
+        origin_mess_id: str | None = None,
+    ) -> LabelProposal:
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        if proposed_by not in jar.agents:
+            raise PermissionError(f"agent {proposed_by} is not on jar {jar.name}")
+        if len(patch.encode("utf-8")) > LABEL_MAX_BYTES:
+            raise ValueError(f"label patch exceeds {LABEL_MAX_BYTES} bytes")
+        if origin_mess_id is not None:
+            origin = self.get_mess(origin_mess_id)
+            if not origin or origin.jar_id != jar.id:
+                raise ValueError(f"origin_mess_id {origin_mess_id!r} is not a mess on jar {jar.name}")
+        proposal = LabelProposal.create(
+            jar_id=jar.id,
+            proposed_by=proposed_by,
+            patch=patch,
+            base_label=jar.label,
+            origin_mess_id=origin_mess_id,
+        )
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO label_proposals (
+                    id, jar_id, proposed_by, base_label, patch, origin_mess_id,
+                    status, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    proposal.id,
+                    proposal.jar_id,
+                    proposal.proposed_by,
+                    proposal.base_label,
+                    proposal.patch,
+                    proposal.origin_mess_id,
+                    proposal.status,
+                    proposal.created_at,
+                ),
+            )
+            conn.commit()
+        return proposal
+
+    def list_label_proposals(
+        self, jar_id_or_name: str, *, status: str | None = "pending"
+    ) -> list[LabelProposal]:
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        q = "SELECT * FROM label_proposals WHERE jar_id = %s"
+        params: list[Any] = [jar.id]
+        if status:
+            q += " AND status = %s"
+            params.append(status)
+        q += " ORDER BY created_at DESC"
+        with self._pool.connection() as conn:
+            rows = conn.execute(q, params).fetchall()
+        return [self._row_to_proposal(r) for r in rows]
+
+    def get_label_proposal(self, proposal_id: str) -> LabelProposal | None:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM label_proposals WHERE id = %s", (proposal_id,)
+            ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def list_approvals(self, proposal_id: str) -> list[dict[str, Any]]:
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT participant, decision, ts, client FROM approvals "
+                "WHERE proposal_id = %s ORDER BY ts",
+                (proposal_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            ts = r["ts"]
+            out.append(
+                {
+                    "participant": r["participant"],
+                    "decision": r["decision"],
+                    "ts": ts if isinstance(ts, str) else ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "client": r["client"],
+                }
+            )
+        return out
+
+    def decide_label_proposal(
+        self,
+        proposal_id: str,
+        *,
+        participant: str,
+        decision: str,
+        client: str | None = None,
+    ) -> LabelProposal:
+        if decision not in ("accept", "reject"):
+            raise ValueError(f"decision must be accept/reject, got {decision!r}")
+        proposal = self.get_label_proposal(proposal_id)
+        if not proposal:
+            raise KeyError(f"label proposal not found: {proposal_id}")
+        jar = self.get_jar(proposal.jar_id)
+        if not jar:
+            raise KeyError(f"jar not found: {proposal.jar_id}")
+        if participant not in jar.agents:
+            raise PermissionError(f"agent {participant} is not on jar {jar.name}")
+
+        now = _now_iso()
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                locked = conn.execute(
+                    "SELECT status FROM label_proposals WHERE id = %s FOR UPDATE",
+                    (proposal.id,),
+                ).fetchone()
+                if locked["status"] != "pending":
+                    raise ValueError(f"proposal {proposal.id} is already {locked['status']}")
+
+                conn.execute(
+                    """
+                    INSERT INTO approvals (id, proposal_id, jar_id, participant, decision, ts, client)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (proposal_id, participant)
+                    DO UPDATE SET decision = EXCLUDED.decision, ts = EXCLUDED.ts, client = EXCLUDED.client
+                    """,
+                    (f"appr_{uuid.uuid4().hex[:12]}", proposal.id, jar.id, participant, decision, now, client),
+                )
+
+                if decision == "reject":
+                    conn.execute(
+                        "UPDATE label_proposals SET status = 'rejected', decided_at = %s WHERE id = %s",
+                        (now, proposal.id),
+                    )
+                else:
+                    accepted = {
+                        r["participant"]
+                        for r in conn.execute(
+                            "SELECT participant FROM approvals WHERE proposal_id = %s AND decision = 'accept'",
+                            (proposal.id,),
+                        ).fetchall()
+                    }
+                    if set(jar.agents) <= accepted:
+                        conn.execute(
+                            "UPDATE jars SET label = %s WHERE id = %s",
+                            (proposal.patch, jar.id),
+                        )
+                        conn.execute(
+                            "UPDATE label_proposals SET status = 'applied', decided_at = %s WHERE id = %s",
+                            (now, proposal.id),
+                        )
+        return self.get_label_proposal(proposal.id)  # type: ignore[return-value]
+
+    def edit_label_proposal(
+        self,
+        proposal_id: str,
+        *,
+        participant: str,
+        patch: str,
+        client: str | None = None,
+    ) -> LabelProposal:
+        proposal = self.get_label_proposal(proposal_id)
+        if not proposal:
+            raise KeyError(f"label proposal not found: {proposal_id}")
+        if proposal.status != "pending":
+            raise ValueError(f"proposal {proposal_id} is already {proposal.status}")
+        jar = self.get_jar(proposal.jar_id)
+        if not jar:
+            raise KeyError(f"jar not found: {proposal.jar_id}")
+        if participant not in jar.agents:
+            raise PermissionError(f"agent {participant} is not on jar {jar.name}")
+        if len(patch.encode("utf-8")) > LABEL_MAX_BYTES:
+            raise ValueError(f"label patch exceeds {LABEL_MAX_BYTES} bytes")
+
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE label_proposals SET patch = %s WHERE id = %s",
+                (patch, proposal_id),
+            )
+            # Text changed — prior accepts no longer mean anything.
+            conn.execute("DELETE FROM approvals WHERE proposal_id = %s", (proposal_id,))
+            conn.commit()
+        return self.decide_label_proposal(
+            proposal_id, participant=participant, decision="accept", client=client
+        )
+
     def send(self, mess: Mess) -> Mess:
         jar = self.get_jar(mess.jar_id)
         if not jar:
@@ -573,6 +807,7 @@ class Store:
             repos=list(self._as_json(row.get("repos_json") or [])),
             paused_reason=row.get("paused_reason"),
             circuit=dict(self._as_json(row.get("circuit_json") or {})) or dict(DEFAULT_CIRCUIT),
+            label=row.get("label"),
         )
 
     def _row_to_mess(self, row: dict[str, Any]) -> Mess:
@@ -591,6 +826,24 @@ class Store:
             schema_version=row["schema_version"],
             seq=row["seq"],
             trigger_source=row.get("trigger_source") or "human",
+        )
+
+    def _row_to_proposal(self, row: dict[str, Any]) -> LabelProposal:
+        def _ts(value: Any) -> str | None:
+            if value is None:
+                return None
+            return value if isinstance(value, str) else value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        return LabelProposal(
+            id=row["id"],
+            jar_id=row["jar_id"],
+            proposed_by=row["proposed_by"],
+            base_label=row.get("base_label"),
+            patch=row["patch"],
+            origin_mess_id=row.get("origin_mess_id"),
+            status=row["status"],
+            created_at=_ts(row["created_at"]),  # type: ignore[arg-type]
+            decided_at=_ts(row.get("decided_at")),
         )
 
 
