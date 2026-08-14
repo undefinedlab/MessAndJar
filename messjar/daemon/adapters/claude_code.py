@@ -7,6 +7,9 @@ from typing import Any
 
 from messjar.daemon.adapters.base import Adapter, InvokeResult, build_prompt
 
+# Read/search only, no shell or file writes — used for agent-triggered spawns.
+READONLY_ALLOWED_TOOLS = "Read,Grep,Glob,WebFetch"
+
 
 class ClaudeCodeAdapter(Adapter):
     name = "claude_code"
@@ -21,10 +24,13 @@ class ClaudeCodeAdapter(Adapter):
         workdir: str,
         session_id: str | None,
         dry_run: bool = False,
+        readonly: bool = False,
     ) -> InvokeResult:
         claude = self.binary(["claude"])
         prompt = build_prompt(mess)
         cmd = [claude or "claude", "-p", prompt, "--output-format", "text"]
+        if readonly:
+            cmd.extend(["--allowedTools", READONLY_ALLOWED_TOOLS])
         if session_id:
             cmd.extend(["--resume", session_id])
 

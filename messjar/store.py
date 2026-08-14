@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from messjar.schema import AgentLocalState, Jar, Mess, MessKind
+from messjar.schema import DEFAULT_CIRCUIT, WAKE_KINDS, AgentLocalState, Jar, Mess, MessKind
 
 
 def normalize_database_url(url: str) -> str:
@@ -19,6 +19,41 @@ def normalize_database_url(url: str) -> str:
     if url.startswith("postgres://"):
         return "postgresql://" + url[len("postgres://") :]
     return url
+
+
+class CircuitBreakerTripped(RuntimeError):
+    """Raised by Store.send() when a jar's spawn-count or hop-depth limit is hit."""
+
+
+def _check_and_update_circuit(
+    cfg: dict[str, Any], state: dict[str, Any], mess: Mess
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Pure rolling-window check. Returns (tripped, reason, new_state).
+
+    Only Messes that would actually spawn a tool session count against the
+    breaker — fyi/artifact never wake an agent (see WAKE_KINDS) so they're
+    exempt. Kept as a free function (not a Store method) so Task 4's
+    policy.py can lift it wholesale later.
+    """
+    if mess.kind not in WAKE_KINDS:
+        return False, None, state
+
+    max_hop_depth = int(cfg.get("max_hop_depth", DEFAULT_CIRCUIT["max_hop_depth"]))
+    if mess.hop >= max_hop_depth:
+        return True, f"hop_depth limit ({max_hop_depth}) reached at hop={mess.hop}", state
+
+    window_s = int(cfg.get("window_s", DEFAULT_CIRCUIT["window_s"]))
+    max_spawns = int(cfg.get("max_spawns", DEFAULT_CIRCUIT["max_spawns"]))
+    now = time.time()
+    window_start = float(state.get("window_start") or 0)
+    count = int(state.get("count") or 0)
+    if not window_start or (now - window_start) > window_s:
+        window_start = now
+        count = 0
+    count += 1
+    if count > max_spawns:
+        return True, f"spawn_count limit ({max_spawns} per {window_s}s) reached", state
+    return False, None, {"window_start": window_start, "count": count}
 
 
 class Store:
@@ -96,6 +131,14 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_jars_password ON jars (password);
                 """
             )
+            conn.execute(
+                """
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS paused_reason TEXT;
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS circuit_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE jars ADD COLUMN IF NOT EXISTS circuit_state_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE messes ADD COLUMN IF NOT EXISTS trigger_source TEXT NOT NULL DEFAULT 'human';
+                """
+            )
             conn.commit()
 
     def create_jar(
@@ -105,17 +148,18 @@ class Store:
         meta: dict[str, Any] | None = None,
         password: str | None = None,
         repos: list[str] | None = None,
+        circuit: dict[str, int] | None = None,
     ) -> Jar:
-        jar = Jar.create(name=name, agents=agents, meta=meta, password=password, repos=repos)
+        jar = Jar.create(name=name, agents=agents, meta=meta, password=password, repos=repos, circuit=circuit)
         with self._pool.connection() as conn:
             try:
                 conn.execute(
                     """
                     INSERT INTO jars (
                         id, name, agents_json, local_json, paused, archived,
-                        created_at, meta_json, password, repos_json
+                        created_at, meta_json, password, repos_json, circuit_json
                     )
-                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s::jsonb)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb)
                     """,
                     (
                         jar.id,
@@ -128,6 +172,7 @@ class Store:
                         json.dumps(jar.meta),
                         jar.password,
                         json.dumps(jar.repos),
+                        json.dumps(jar.circuit),
                     ),
                 )
                 conn.commit()
@@ -235,14 +280,48 @@ class Store:
             jars = [j for j in jars if agent_id in j.agents]
         return jars
 
-    def set_jar_paused(self, jar_id_or_name: str, paused: bool) -> Jar:
+    def set_jar_paused(self, jar_id_or_name: str, paused: bool, *, reason: str | None = None) -> Jar:
         jar = self.get_jar(jar_id_or_name)
         if not jar:
             raise KeyError(f"jar not found: {jar_id_or_name}")
         with self._pool.connection() as conn:
-            conn.execute("UPDATE jars SET paused = %s WHERE id = %s", (paused, jar.id))
+            if paused:
+                conn.execute(
+                    "UPDATE jars SET paused = TRUE, paused_reason = %s WHERE id = %s",
+                    (reason, jar.id),
+                )
+                jar.paused_reason = reason
+            else:
+                # Resuming always clears the trip reason and resets the
+                # rolling-window counters — this is what un-trips a breaker.
+                conn.execute(
+                    "UPDATE jars SET paused = FALSE, paused_reason = NULL, "
+                    "circuit_state_json = '{}'::jsonb WHERE id = %s",
+                    (jar.id,),
+                )
+                jar.paused_reason = None
             conn.commit()
         jar.paused = paused
+        return jar
+
+    def set_jar_circuit(self, jar_id_or_name: str, cfg: dict[str, int]) -> Jar:
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        merged = dict(jar.circuit)
+        for key in ("max_spawns", "window_s", "max_hop_depth"):
+            if key in cfg and cfg[key] is not None:
+                value = int(cfg[key])
+                if value <= 0:
+                    raise ValueError(f"{key} must be positive")
+                merged[key] = value
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE jars SET circuit_json = %s::jsonb WHERE id = %s",
+                (json.dumps(merged), jar.id),
+            )
+            conn.commit()
+        jar.circuit = merged
         return jar
 
     def update_agent_local(self, jar_id: str, state: AgentLocalState) -> Jar:
@@ -308,49 +387,82 @@ class Store:
         jar = self.get_jar(mess.jar_id)
         if not jar:
             raise KeyError(f"jar not found: {mess.jar_id}")
-        if jar.paused:
-            raise RuntimeError(f"jar {jar.name} is paused")
         if mess.from_agent not in jar.agents or mess.to_agent not in jar.agents:
             raise ValueError("from/to must be participants on the jar")
         mess.jar_id = jar.id
+        trip_reason: str | None = None
         with self._pool.connection() as conn:
             with conn.transaction():
-                conn.execute("SELECT id FROM jars WHERE id = %s FOR UPDATE", (jar.id,))
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) AS m FROM messes WHERE jar_id = %s",
+                # Lock the jar row first, then re-read paused/circuit state
+                # from under the lock — reading jar.paused before acquiring
+                # FOR UPDATE (as before) is a TOCTOU race against concurrent
+                # sends racing the circuit breaker's counters.
+                locked = conn.execute(
+                    "SELECT paused, paused_reason, circuit_json, circuit_state_json "
+                    "FROM jars WHERE id = %s FOR UPDATE",
                     (jar.id,),
                 ).fetchone()
-                seq = int(row["m"]) + 1
-                mess.seq = seq
-                conn.execute(
-                    """
-                    INSERT INTO messes (
-                        id, jar_id, seq, from_agent, to_agent, body, kind,
-                        reply_expected, hop, refs_json, ts, schema_version
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-                    """,
-                    (
-                        mess.id,
-                        mess.jar_id,
-                        seq,
-                        mess.from_agent,
-                        mess.to_agent,
-                        mess.body,
-                        mess.kind.value,
-                        mess.reply_expected,
-                        mess.hop,
-                        json.dumps(mess.refs),
-                        mess.ts,
-                        mess.schema_version,
-                    ),
-                )
-                sender = jar.local.get(mess.from_agent) or AgentLocalState(agent_id=mess.from_agent)
-                sender.hop = max(sender.hop, mess.hop)
-                jar.local[mess.from_agent] = sender
-                conn.execute(
-                    "UPDATE jars SET local_json = %s::jsonb WHERE id = %s",
-                    (json.dumps({k: v.model_dump() for k, v in jar.local.items()}), jar.id),
-                )
+                if locked["paused"]:
+                    reason = locked["paused_reason"]
+                    raise RuntimeError(f"jar {jar.name} is paused" + (f": {reason}" if reason else ""))
+
+                circuit_cfg = self._as_json(locked["circuit_json"] or {}) or dict(jar.circuit)
+                circuit_state = self._as_json(locked["circuit_state_json"] or {}) or {}
+                tripped, reason, new_state = _check_and_update_circuit(circuit_cfg, circuit_state, mess)
+                if tripped:
+                    # Don't raise inside this `with conn.transaction()` block —
+                    # an exception here rolls back the whole nested transaction,
+                    # which would undo the pause UPDATE below along with it.
+                    # Let the block commit normally, then raise once we're out.
+                    conn.execute(
+                        "UPDATE jars SET paused = TRUE, paused_reason = %s, "
+                        "circuit_state_json = %s::jsonb WHERE id = %s",
+                        (reason, json.dumps(new_state), jar.id),
+                    )
+                    trip_reason = reason
+                else:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) AS m FROM messes WHERE jar_id = %s",
+                        (jar.id,),
+                    ).fetchone()
+                    seq = int(row["m"]) + 1
+                    mess.seq = seq
+                    conn.execute(
+                        """
+                        INSERT INTO messes (
+                            id, jar_id, seq, from_agent, to_agent, body, kind,
+                            reply_expected, hop, refs_json, ts, schema_version, trigger_source
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                        """,
+                        (
+                            mess.id,
+                            mess.jar_id,
+                            seq,
+                            mess.from_agent,
+                            mess.to_agent,
+                            mess.body,
+                            mess.kind.value,
+                            mess.reply_expected,
+                            mess.hop,
+                            json.dumps(mess.refs),
+                            mess.ts,
+                            mess.schema_version,
+                            mess.trigger_source,
+                        ),
+                    )
+                    sender = jar.local.get(mess.from_agent) or AgentLocalState(agent_id=mess.from_agent)
+                    sender.hop = max(sender.hop, mess.hop)
+                    jar.local[mess.from_agent] = sender
+                    conn.execute(
+                        "UPDATE jars SET local_json = %s::jsonb, circuit_state_json = %s::jsonb WHERE id = %s",
+                        (
+                            json.dumps({k: v.model_dump() for k, v in jar.local.items()}),
+                            json.dumps(new_state),
+                            jar.id,
+                        ),
+                    )
+        if trip_reason is not None:
+            raise CircuitBreakerTripped(f"circuit breaker tripped on jar {jar.name}: {trip_reason}")
         return mess
 
     def list_messes(
@@ -459,6 +571,8 @@ class Store:
             meta=dict(self._as_json(row["meta_json"] or {})),
             password=row.get("password"),
             repos=list(self._as_json(row.get("repos_json") or [])),
+            paused_reason=row.get("paused_reason"),
+            circuit=dict(self._as_json(row.get("circuit_json") or {})) or dict(DEFAULT_CIRCUIT),
         )
 
     def _row_to_mess(self, row: dict[str, Any]) -> Mess:
@@ -476,6 +590,7 @@ class Store:
             ts=ts_s,
             schema_version=row["schema_version"],
             seq=row["seq"],
+            trigger_source=row.get("trigger_source") or "human",
         )
 
 

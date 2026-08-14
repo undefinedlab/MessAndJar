@@ -36,8 +36,14 @@ class Adapter(ABC):
         workdir: str,
         session_id: str | None,
         dry_run: bool = False,
+        readonly: bool = False,
     ) -> InvokeResult:
-        """Turn a Mess into a tool run. May resume session_id when supported."""
+        """Turn a Mess into a tool run. May resume session_id when supported.
+
+        readonly=True means this spawn was caused by another agent's message
+        (trigger_source="agent"), not a human — the invocation must not be
+        able to write to the filesystem.
+        """
 
     def binary(self, candidates: list[str]) -> str | None:
         for c in candidates:

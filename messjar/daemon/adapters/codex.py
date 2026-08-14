@@ -21,11 +21,13 @@ class CodexAdapter(Adapter):
         workdir: str,
         session_id: str | None,
         dry_run: bool = False,
+        readonly: bool = False,
     ) -> InvokeResult:
         binary = self.binary(["codex"])
         prompt = build_prompt(mess)
         # `codex exec` is the non-interactive path in recent CLIs
-        cmd = [binary or "codex", "exec", "--full-auto", prompt]
+        mode_flags = ["--sandbox", "read-only"] if readonly else ["--full-auto"]
+        cmd = [binary or "codex", "exec", *mode_flags, prompt]
         if session_id:
             cmd.extend(["--session", session_id])
 

@@ -21,7 +21,17 @@ class OpenCodeAdapter(Adapter):
         workdir: str,
         session_id: str | None,
         dry_run: bool = False,
+        readonly: bool = False,
     ) -> InvokeResult:
+        if readonly:
+            # OpenCode has no documented read-only/plan CLI mode. The daemon
+            # is expected to skip agent-triggered opencode spawns before
+            # ever calling invoke() with readonly=True — this only fires if
+            # that gate regresses, so fail loudly rather than silently
+            # granting write access.
+            raise NotImplementedError(
+                "opencode read-only spawns are unsupported; caller must skip before invoking"
+            )
         binary = self.binary(["opencode"])
         prompt = build_prompt(mess)
         cmd = [binary or "opencode", "run", prompt]

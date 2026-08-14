@@ -87,6 +87,7 @@ class BusClient:
         reply_expected: bool | None = None,
         hop: int = 0,
         refs: list[str] | None = None,
+        trigger_source: str = "human",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "jar": jar,
@@ -96,10 +97,16 @@ class BusClient:
             "kind": kind,
             "hop": hop,
             "refs": refs or [],
+            "trigger_source": trigger_source,
         }
         if reply_expected is not None:
             payload["reply_expected"] = reply_expected
         r = self._client.post("/send", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def set_circuit(self, jar: str, **cfg: int) -> dict[str, Any]:
+        r = self._client.post(f"/jars/{jar}/circuit", json=cfg)
         r.raise_for_status()
         return r.json()
 
