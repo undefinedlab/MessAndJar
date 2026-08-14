@@ -124,6 +124,25 @@ mj digest --agent alex@cursor
 
 ---
 
+## 🤖 Triggers — autonomous, but still bounded
+
+Four small triggers turn an external event into a mess, the same way a human always could — just without a human typing the command:
+
+- **on_blocked** — baked into every spawn's prompt, unconditionally: if an agent gets blocked on something outside its own declared scope, it's told to ask (a `question`) rather than guess, stub, or work around it silently.
+- **on_push** — `mj trigger on-push`, meant for git's `pre-push` hook. Fans an `fyi` + the pushed SHA out to everyone else on the jar.
+- **on_session_end** — `mj trigger on-session-end`, meant for a Claude Code `Stop` hook. Reads real `git status`/diff, matches changed paths against the jar's `## Owned by`, and hands off to whoever owns them — or broadcasts an `fyi` if nothing matches. This is the trigger that delivers on this README's opening line: your agent finishes, notices the next step isn't yours, and hands it off before you close the laptop.
+- **on_ci_fail** — `mj trigger on-ci-fail`, run as a CI job step (e.g. `if: failure()`). Routes a `question` to whoever owns the failing paths, or an explicit `--to` fallback.
+
+Every trigger sends with `trigger_source=agent` — so a triggered handoff is held for the sending human exactly like *Bounded, not just connected* describes above, and a triggered spawn on the receiving end runs read-only. Autonomy doesn't get a shortcut around any of the guardrails.
+
+```bash
+mj trigger on-push <jar> --from alex@cursor --sha "$(git rev-parse HEAD)"
+mj trigger on-session-end <jar> --from alex@cursor --workdir .
+mj trigger on-ci-fail <jar> --from alex@cursor --paths "src/billing/x.py" --summary "3 tests failed" --to alex@cursor
+```
+
+---
+
 ## ⚡ Quick start (local)
 
 ```bash
@@ -151,6 +170,7 @@ mj pause --all / mj resume --all       # local kill switch, no network
 mj digest --agent <you>                # what's blocked on you, everywhere
 mj label propose/list/accept/reject/edit <jar> ...
 mj held list/approve/reject <jar> ...  # agent-triggered handoffs awaiting you
+mj trigger on-push/on-session-end/on-ci-fail <jar> ...  # wire into git/Claude Code/CI hooks
 mj daemon run ...           # wire a real CLI agent to a jar
 ```
 
@@ -221,7 +241,8 @@ messjar/
 ├── mcp_protocol.py                # Streamable HTTP MCP surface (/mcp)
 ├── daemon/
 │   ├── runner.py                    # polls a jar, drives an adapter
-│   └── adapters/                     # cursor, claude_code, codex, opencode
+│   ├── adapters/                     # cursor, claude_code, codex, opencode
+│   └── triggers/                      # on_blocked, on_push, on_session_end, on_ci_fail
 └── cli.py                              # `mj` — everything above, from your terminal
 ```
 
