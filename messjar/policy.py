@@ -26,6 +26,17 @@ class ScopeViolation(ValueError):
     """A handoff's target path falls outside the recipient's declared scope."""
 
 
+def normalize_scope_path(path: str) -> str:
+    """Canonicalize a path for `## Owned by` comparison: always a leading
+    slash. `## Owned by` entries are conventionally written /like/this, but
+    real-world path sources disagree — git reports paths relative to the
+    repo root with no leading slash, CI tooling varies by provider. Both
+    sides of every scope comparison go through this so `/src/x` and `src/x`
+    are treated as the same claim.
+    """
+    return "/" + path.strip().lstrip("/")
+
+
 def parse_owned_by(label: str | None) -> dict[str, list[str]]:
     """Parse a `## Owned by` section (`- agent_id: /path` bullets) out of a
     jar's label into {agent_id: [path prefixes]}. Sections are convention,
@@ -51,7 +62,7 @@ def parse_owned_by(label: str | None) -> dict[str, list[str]]:
         path = path.strip()
         if not agent or not path:
             continue
-        owned.setdefault(agent, []).append(path)
+        owned.setdefault(agent, []).append(normalize_scope_path(path))
     return owned
 
 
@@ -77,7 +88,11 @@ def check_scope(jar: Jar, mess: Mess) -> None:
     recipient_scope = owned_by.get(mess.to_agent)
     if not recipient_scope:
         return
-    target_paths = [r[len(HANDOFF_PATH_PREFIX) :] for r in mess.refs if r.startswith(HANDOFF_PATH_PREFIX)]
+    target_paths = [
+        normalize_scope_path(r[len(HANDOFF_PATH_PREFIX) :])
+        for r in mess.refs
+        if r.startswith(HANDOFF_PATH_PREFIX)
+    ]
     if not target_paths:
         return
     for path in target_paths:

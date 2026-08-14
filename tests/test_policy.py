@@ -85,6 +85,21 @@ def test_check_scope_rejects_outside_declared_prefix() -> None:
         policy.check_scope(jar, mess)
 
 
+def test_check_scope_normalizes_leading_slash() -> None:
+    """A `path:` ref without a leading slash still matches a `## Owned by`
+    entry written with one (and vice versa) — real-world path sources
+    (git, CI tooling) don't reliably agree on the convention."""
+    jar = _mk_jar(label="## Owned by\n- b@claude: /src/billing")
+    mess = _mk_mess(refs=["path:src/billing/invoices.py"])  # no leading slash
+    policy.check_scope(jar, mess)  # no raise
+
+
+def test_normalize_scope_path() -> None:
+    assert policy.normalize_scope_path("/src/api") == "/src/api"
+    assert policy.normalize_scope_path("src/api") == "/src/api"
+    assert policy.normalize_scope_path("  /src/api  ") == "/src/api"
+
+
 def test_check_scope_exempt_for_human_trigger_source() -> None:
     """A human's own direct action isn't gated the same way an agent's is —
     matches tier_for()'s human-is-always-free rule and Task 1's readonly
