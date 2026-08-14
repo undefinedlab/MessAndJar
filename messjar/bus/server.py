@@ -24,7 +24,7 @@ from messjar.mcp_auth_asgi import mcp_auth_middleware
 from messjar.mcp_protocol import build_mcp
 from messjar.schema import AgentLocalState, Jar, Mess, MessKind
 from messjar.share import agent_mcp_bundle, connection_bundle
-from messjar.store import Store, database_host_label, normalize_database_url
+from messjar.store import CircuitBreakerTripped, Store, database_host_label, normalize_database_url
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 STATIC_DIR = WEB_DIR / "static"
@@ -37,6 +37,7 @@ class CreateJarBody(BaseModel):
     password: str | None = None
     repos: list[str] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
+    circuit: dict[str, int] | None = None
 
 
 class JoinBody(BaseModel):
@@ -63,6 +64,7 @@ class SendBody(BaseModel):
     refs: list[str] = Field(default_factory=list)
     repo: str | None = None
     workdir: str | None = None
+    trigger_source: str = "human"
 
     model_config = {"populate_by_name": True}
 
@@ -112,6 +114,12 @@ class LocalStateBody(BaseModel):
     hop: int | None = None
     paused: bool | None = None
     repo: str | None = None
+
+
+class CircuitConfigBody(BaseModel):
+    max_spawns: int | None = None
+    window_s: int | None = None
+    max_hop_depth: int | None = None
 
 
 def _request_base(request: Request) -> str:
@@ -288,7 +296,12 @@ def create_app(store: Store) -> FastAPI:
     def public_create_jar(request: Request, body: CreateJarBody) -> dict[str, Any]:
         try:
             jar = store.create_jar(
-                body.name, body.agents, body.meta, password=body.password, repos=body.repos
+                body.name,
+                body.agents,
+                body.meta,
+                password=body.password,
+                repos=body.repos,
+                circuit=body.circuit,
             )
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
@@ -348,7 +361,12 @@ def create_app(store: Store) -> FastAPI:
             raise HTTPException(403, "admin password required to create via API (or use /api/jars)")
         try:
             jar = store.create_jar(
-                body.name, body.agents, body.meta, password=body.password, repos=body.repos
+                body.name,
+                body.agents,
+                body.meta,
+                password=body.password,
+                repos=body.repos,
+                circuit=body.circuit,
             )
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
@@ -402,6 +420,20 @@ def create_app(store: Store) -> FastAPI:
             raise HTTPException(404, "jar not found")
         require_jar_access(auth, j)
         return store.set_jar_paused(jar, False).public_dict()
+
+    @app.post("/jars/{jar}/circuit")
+    def set_jar_circuit(
+        jar: str, body: CircuitConfigBody, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        cfg = {k: v for k, v in body.model_dump().items() if v is not None}
+        try:
+            return store.set_jar_circuit(jar, cfg).public_dict()
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
 
     @app.get("/jars/{jar}/messes")
     def jar_messes(
@@ -705,8 +737,11 @@ def _send(store: Store, body: SendBody) -> dict[str, Any]:
             reply_expected=body.reply_expected,
             hop=body.hop,
             refs=body.refs,
+            trigger_source=body.trigger_source,
         )
         return store.send(mess).model_dump(by_alias=True)
+    except CircuitBreakerTripped as e:
+        raise HTTPException(429, str(e)) from e
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e)) from e
 

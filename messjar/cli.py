@@ -173,25 +173,54 @@ def tail_jar(
 
 @app.command("pause")
 def pause_jar(
-    jar: str = typer.Argument(...),
+    jar: Optional[str] = typer.Argument(None),
+    all: bool = typer.Option(
+        False,
+        "--all",
+        help="Local kill switch: pauses every daemon on this machine. No network/DB.",
+    ),
+    reason: Optional[str] = typer.Option(None, "--reason"),
     bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
     password: Optional[str] = typer.Option(
         None, "--password", "-p", envvar="MESSJAR_PASSWORD"
     ),
 ) -> None:
+    if all:
+        from messjar.localstate import engage_killswitch
+
+        state = engage_killswitch(reason)
+        suffix = f" ({state['reason']})" if state.get("reason") else ""
+        console.print(f"local kill switch engaged at {state['paused_at']}{suffix}")
+        return
+    if not jar:
+        raise typer.BadParameter("jar name required unless --all")
     with _client(bus, password) as c:
         j = c.pause(jar)
-    console.print(f"paused [cyan]{j['name']}[/]")
+    reason_suffix = f" reason={j['paused_reason']}" if j.get("paused_reason") else ""
+    console.print(f"paused [cyan]{j['name']}[/]{reason_suffix}")
 
 
 @app.command("resume")
 def resume_jar(
-    jar: str = typer.Argument(...),
+    jar: Optional[str] = typer.Argument(None),
+    all: bool = typer.Option(
+        False, "--all", help="Release the local kill switch. No network/DB."
+    ),
     bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
     password: Optional[str] = typer.Option(
         None, "--password", "-p", envvar="MESSJAR_PASSWORD"
     ),
 ) -> None:
+    if all:
+        from messjar.localstate import release_killswitch
+
+        was_engaged = release_killswitch()
+        console.print(
+            "local kill switch released" if was_engaged else "local kill switch was not engaged"
+        )
+        return
+    if not jar:
+        raise typer.BadParameter("jar name required unless --all")
     with _client(bus, password) as c:
         j = c.resume(jar)
     console.print(f"resumed [cyan]{j['name']}[/]")
@@ -237,7 +266,7 @@ def daemon_run(
         notify=notify,
     )
     if once:
-        n = d.poll_once()
+        n = d.tick()
         console.print(f"handled {n} mess(es)")
         return
     try:

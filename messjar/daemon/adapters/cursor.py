@@ -21,6 +21,7 @@ class CursorAdapter(Adapter):
         workdir: str,
         session_id: str | None,
         dry_run: bool = False,
+        readonly: bool = False,
     ) -> InvokeResult:
         binary = self.binary(["cursor-agent", "agent", "cursor"])
         prompt = build_prompt(mess)
@@ -29,6 +30,8 @@ class CursorAdapter(Adapter):
             cmd = [binary, "agent", "-p", prompt]
         else:
             cmd = [binary or "cursor-agent", "-p", prompt]
+        if readonly:
+            cmd.extend(["--mode", "plan"])
         if session_id:
             cmd.extend(["--resume", session_id])
 

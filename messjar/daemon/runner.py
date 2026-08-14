@@ -9,8 +9,9 @@ from typing import Any
 
 from messjar.client import BusClient
 from messjar.daemon.adapters import get_adapter
-from messjar.notify import notify_mess
-from messjar.schema import MessKind
+from messjar.localstate import killswitch_state
+from messjar.notify import notify_circuit_trip, notify_mess
+from messjar.schema import WAKE_KINDS, MessKind
 
 log = logging.getLogger("messjar.daemon")
 
@@ -42,6 +43,7 @@ class Daemon:
         self.auto_reply = auto_reply
         self.notify = notify
         self._stop = False
+        self._notified_trips: set[str] = set()
 
     def stop(self) -> None:
         self._stop = True
@@ -57,10 +59,46 @@ class Daemon:
         )
         while not self._stop:
             try:
-                self.poll_once()
+                self.tick()
             except Exception:
                 log.exception("poll failed")
             time.sleep(self.poll_s)
+
+    def tick(self) -> int:
+        """One loop iteration: local kill switch, then circuit-trip check, then poll.
+
+        The kill switch is checked first and short-circuits before any
+        network call — it must work with the bus completely unreachable.
+        """
+        ks = killswitch_state()
+        if ks is not None:
+            log.warning(
+                "local kill switch engaged (%s); skipping poll",
+                ks.get("reason") or "no reason given",
+            )
+            return 0
+        self._check_circuit_trips()
+        return self.poll_once()
+
+    def _check_circuit_trips(self) -> None:
+        try:
+            if self.jar_filter:
+                jars = [self.bus.get_jar(self.jar_filter)]
+            else:
+                jars = self.bus.list_jars(self.agent_id)
+        except Exception:
+            log.debug("circuit-trip check failed", exc_info=True)
+            return
+        for jar in jars:
+            jid = jar.get("id")
+            reason = jar.get("paused_reason")
+            if jar.get("paused") and reason:
+                if jid not in self._notified_trips:
+                    notify_circuit_trip(jar)
+                    self._notified_trips.add(jid)
+                    log.warning("circuit breaker tripped jar=%s reason=%s", jar.get("name"), reason)
+            else:
+                self._notified_trips.discard(jid)
 
     def poll_once(self) -> int:
         batch = self.bus.check_jar(self.agent_id, self.jar_filter, ack=True)
@@ -98,11 +136,7 @@ class Daemon:
             return
 
         # fyi: notify already fired; queue without spawning an agent
-        wakes = kind in (
-            MessKind.question.value,
-            MessKind.handoff.value,
-            MessKind.answer.value,
-        )
+        wakes = kind in (k.value for k in WAKE_KINDS)
         if not wakes and kind == MessKind.fyi.value:
             log.info("fyi queued (no wake); recording only")
             self.bus.update_local(
@@ -113,12 +147,24 @@ class Daemon:
             )
             return
 
+        trigger_source = mess.get("trigger_source") or "human"
+        readonly = trigger_source == "agent"
+        if readonly and self.adapter.name == "opencode":
+            log.warning(
+                "agent-triggered spawn on opencode is unsupported (no sandboxing yet); "
+                "skipping jar=%s mess=%s",
+                jar.get("name"),
+                mess.get("id"),
+            )
+            return
+
         session_id = local.get("session_id")
         result = self.adapter.invoke(
             mess,
             workdir=local.get("workdir") or self.workdir,
             session_id=session_id,
             dry_run=self.dry_run or not self.adapter.available(),
+            readonly=readonly,
         )
         if result.dry_run:
             log.info("dry-run cmd=%s", result.command)
@@ -147,8 +193,13 @@ class Daemon:
                 to_agent=mess["from"],
                 body=result.reply_body,
                 kind=result.reply_kind,
-                reply_expected=False,
+                # Mirror the incoming Mess's reply_expected so a
+                # question<->answer exchange can actually continue — this is
+                # the one place in the codebase that autonomously generates
+                # a Mess with no human at the keyboard, hence trigger_source.
+                reply_expected=mess.get("reply_expected", False),
                 hop=hop + 1,
                 refs=[f"mess:{mess['id']}"],
+                trigger_source="agent",
             )
             log.info("sent reply id=%s hop=%s", reply.get("id"), hop + 1)

@@ -121,6 +121,7 @@ def build_mcp() -> FastMCP:
         reply_expected: bool | None = None,
         hop: int = 0,
         refs: list[str] | None = None,
+        trigger_source: str = "human",
     ) -> dict[str, Any]:
         """Post a Mess. Pass workdir/repo (or jar) so the bus picks the thread.
 
@@ -140,6 +141,7 @@ def build_mcp() -> FastMCP:
             reply_expected=reply_expected,
             hop=hop,
             refs=refs or [],
+            trigger_source=trigger_source,
         )
         return store.send(mess).model_dump(by_alias=True)
 

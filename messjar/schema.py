@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -23,6 +23,13 @@ class MessKind(str, Enum):
     fyi = "fyi"  # queue until next session
     answer = "answer"  # reply to a question
     artifact = "artifact"  # substantive attachment pointer / inline payload
+
+
+# Single source of truth for "does this Mess spawn a tool session" — used by
+# Mess.wakes_agent(), the daemon poll loop, and the store's circuit breaker.
+WAKE_KINDS: tuple[MessKind, ...] = (MessKind.question, MessKind.handoff, MessKind.answer)
+
+DEFAULT_CIRCUIT: dict[str, int] = {"max_spawns": 20, "window_s": 300, "max_hop_depth": 10}
 
 
 class AgentLocalState(BaseModel):
@@ -48,6 +55,8 @@ class Jar(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
     password: str | None = Field(default=None, exclude=True)
     repos: list[str] = Field(default_factory=list)
+    paused_reason: str | None = None
+    circuit: dict[str, int] = Field(default_factory=lambda: dict(DEFAULT_CIRCUIT))
 
     @classmethod
     def create(
@@ -57,6 +66,7 @@ class Jar(BaseModel):
         meta: dict[str, Any] | None = None,
         password: str | None = None,
         repos: list[str] | None = None,
+        circuit: dict[str, int] | None = None,
     ) -> Jar:
         from messjar.auth import generate_password
         from messjar.repo import normalize_repo_key
@@ -75,6 +85,8 @@ class Jar(BaseModel):
         now = _now()
         jar_id = f"jar_{uuid4().hex[:12]}"
         local = {a: AgentLocalState(agent_id=a) for a in agents}
+        merged_circuit = dict(DEFAULT_CIRCUIT)
+        merged_circuit.update({k: v for k, v in (circuit or {}).items() if k in DEFAULT_CIRCUIT})
         return cls(
             id=jar_id,
             name=name,
@@ -84,6 +96,7 @@ class Jar(BaseModel):
             meta=meta or {},
             password=(password.strip() if password and password.strip() else generate_password()),
             repos=repo_keys,
+            circuit=merged_circuit,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -103,6 +116,7 @@ class Mess(BaseModel):
     ts: str
     schema_version: int = SCHEMA_VERSION
     seq: int | None = None  # assigned by store
+    trigger_source: Literal["human", "agent"] = "human"
 
     model_config = {"populate_by_name": True}
 
@@ -118,6 +132,7 @@ class Mess(BaseModel):
         reply_expected: bool | None = None,
         hop: int = 0,
         refs: list[str] | None = None,
+        trigger_source: str = "human",
     ) -> Mess:
         if isinstance(kind, str):
             kind = MessKind(kind)
@@ -137,11 +152,12 @@ class Mess(BaseModel):
             refs=refs or [],
             ts=_now(),
             schema_version=SCHEMA_VERSION,
+            trigger_source=trigger_source,  # type: ignore[arg-type]
         )
 
     def wakes_agent(self) -> bool:
         """Daemon: should this Mess spawn a tool session now?"""
-        return self.kind in (MessKind.question, MessKind.handoff, MessKind.answer)
+        return self.kind in WAKE_KINDS
 
 
 def _now() -> str:

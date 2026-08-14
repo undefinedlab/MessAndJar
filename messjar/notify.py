@@ -44,6 +44,14 @@ def notify_mess(jar: dict[str, Any], mess: dict[str, Any]) -> bool:
     return notify(title, body, urgency=urgency)
 
 
+def notify_circuit_trip(jar: dict[str, Any]) -> bool:
+    jar_name = jar.get("name") or jar.get("id") or "jar"
+    reason = jar.get("paused_reason") or "circuit breaker tripped"
+    title = f"Mess&Jar · {jar_name}"
+    body = f"circuit breaker tripped: {reason}"
+    return notify(title, body, urgency="critical")
+
+
 def _linux(title: str, body: str, *, urgency: str) -> bool:
     if shutil.which("notify-send"):
         subprocess.run(
