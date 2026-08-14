@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from messjar.daemon.triggers.on_blocked import BLOCKED_GUIDANCE
+
 
 @dataclass
 class InvokeResult:
@@ -98,5 +100,6 @@ def build_prompt(
         f"{mess.get('body', '')}\n"
         f"--- end ---\n\n"
         f"Act on this in the current working directory. If a reply is expected, "
-        f"finish with a short concrete answer suitable to send back as a Mess."
+        f"finish with a short concrete answer suitable to send back as a Mess. "
+        + BLOCKED_GUIDANCE
     )

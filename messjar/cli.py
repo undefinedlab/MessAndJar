@@ -25,11 +25,13 @@ bus_app = typer.Typer(help="Run the bus")
 daemon_app = typer.Typer(help="Run a local agent daemon")
 label_app = typer.Typer(help="Propose and review changes to a jar's label")
 held_app = typer.Typer(help="Review handoff/artifact messages held for your approval")
+trigger_app = typer.Typer(help="Fire an autonomous trigger (git hook, Claude Code Stop hook, CI step)")
 app.add_typer(jars_app, name="jars")
 app.add_typer(bus_app, name="bus")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(label_app, name="label")
 app.add_typer(held_app, name="held")
+app.add_typer(trigger_app, name="trigger")
 
 console = Console()
 DEFAULT_BUS = os.environ.get("MESSJAR_BUS", "http://127.0.0.1:7420")
@@ -463,6 +465,110 @@ def held_reject(
     with _client(bus, password) as c:
         h = c.reject_held(jar, held_id, rejected_by=agent)
     console.print(f"[cyan]{held_id}[/] status={h['status']}")
+
+
+def _fire_planned(c: BusClient, jar: str, *, from_agent: str, planned: list[dict]) -> None:
+    """Shared send loop for every trigger: send() already routes through the
+    policy gate (Task 4) exactly like a human-issued `mj send` would — a
+    triggered handoff can come back held, same as any other agent-sourced
+    handoff. Nothing here bypasses that."""
+    if not planned:
+        console.print("[dim]nothing to report[/]")
+        return
+    for p in planned:
+        mess = c.send(
+            jar,
+            from_agent=from_agent,
+            to_agent=p["to_agent"],
+            body=p["body"],
+            kind=p["kind"],
+            refs=p.get("refs") or [],
+            reply_expected=p.get("reply_expected"),
+            trigger_source="agent",
+        )
+        verb = "held" if mess.get("status") == "held" else "sent"
+        console.print(f"{verb} [cyan]{mess['id']}[/] {p['kind']} → {p['to_agent']}")
+
+
+@trigger_app.command("on-push")
+def trigger_on_push(
+    jar: str = typer.Argument(...),
+    from_agent: str = typer.Option(..., "--from"),
+    sha: str = typer.Option(..., "--sha"),
+    branch: Optional[str] = typer.Option(None, "--branch"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    """Meant to be installed as git's pre-push hook (git has no native
+    post-push hook). Fans an fyi out to every other agent on the jar."""
+    from messjar.daemon.triggers.on_push import plan_push_notice
+
+    with _client(bus, password) as c:
+        j = c.get_jar(jar)
+        planned = plan_push_notice(agents=j["agents"], from_agent=from_agent, sha=sha, branch=branch)
+        _fire_planned(c, jar, from_agent=from_agent, planned=planned)
+
+
+@trigger_app.command("on-session-end")
+def trigger_on_session_end(
+    jar: str = typer.Argument(...),
+    from_agent: str = typer.Option(..., "--from"),
+    workdir: Path = typer.Option(Path.cwd(), "--workdir"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    """Meant to be wired into a Claude Code Stop hook. Summarizes git
+    changes under --workdir and hands off to whoever's `## Owned by` scope
+    they fall under (or broadcasts an fyi if nothing matches)."""
+    from messjar.daemon.triggers.on_session_end import git_session_changes, plan_session_end_notice
+
+    summary, changed_paths = git_session_changes(str(workdir))
+    if not changed_paths:
+        console.print("[dim]nothing changed, nothing to report[/]")
+        return
+    with _client(bus, password) as c:
+        j = c.get_jar(jar)
+        planned = plan_session_end_notice(
+            agents=j["agents"],
+            from_agent=from_agent,
+            label=j.get("label"),
+            changed_paths=changed_paths,
+            summary=summary,
+        )
+        _fire_planned(c, jar, from_agent=from_agent, planned=planned)
+
+
+@trigger_app.command("on-ci-fail")
+def trigger_on_ci_fail(
+    jar: str = typer.Argument(...),
+    from_agent: str = typer.Option(..., "--from"),
+    paths: str = typer.Option(..., "--paths", help="Comma-separated failing paths"),
+    summary: str = typer.Option(..., "--summary"),
+    sha: Optional[str] = typer.Option(None, "--sha"),
+    to: Optional[str] = typer.Option(
+        None, "--to", help="Fallback recipient if no ## Owned by entry matches a failing path"
+    ),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", envvar="MESSJAR_PASSWORD"),
+) -> None:
+    """Run as a CI job step (e.g. `if: failure()`). Routes a question to
+    whoever's `## Owned by` scope covers the failing paths, or --to as an
+    explicit fallback when nothing matches."""
+    from messjar.daemon.triggers.on_ci_fail import plan_ci_fail_notice
+
+    path_list = [p.strip() for p in paths.split(",") if p.strip()]
+    with _client(bus, password) as c:
+        j = c.get_jar(jar)
+        planned = plan_ci_fail_notice(
+            agents=j["agents"],
+            from_agent=from_agent,
+            label=j.get("label"),
+            failing_paths=path_list,
+            summary=summary,
+            sha=sha,
+            fallback_to=to,
+        )
+        _fire_planned(c, jar, from_agent=from_agent, planned=planned)
 
 
 @daemon_app.command("run")
