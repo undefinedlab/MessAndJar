@@ -38,6 +38,7 @@ class Adapter(ABC):
         dry_run: bool = False,
         readonly: bool = False,
         label: str | None = None,
+        unverified_refs: list[str] | None = None,
     ) -> InvokeResult:
         """Turn a Mess into a tool run. May resume session_id when supported.
 
@@ -48,6 +49,10 @@ class Adapter(ABC):
         label is the jar's current agreed context (see schema.LabelProposal)
         — injected above the message body so a decision made days ago
         survives without replaying history.
+
+        unverified_refs lists any refs on this Mess that claimed to be
+        checkable (sha:/file:) but did not resolve in this workdir — surfaced
+        loudly in the prompt rather than silently trusted.
         """
 
     def binary(self, candidates: list[str]) -> str | None:
@@ -58,7 +63,9 @@ class Adapter(ABC):
         return None
 
 
-def build_prompt(mess: dict[str, Any], *, label: str | None = None) -> str:
+def build_prompt(
+    mess: dict[str, Any], *, label: str | None = None, unverified_refs: list[str] | None = None
+) -> str:
     """Shared prompt wrapper so adapters stay thin."""
     label_block = ""
     if label:
@@ -67,11 +74,21 @@ def build_prompt(mess: dict[str, Any], *, label: str | None = None) -> str:
             f"{label}\n"
             f"--- end label ---\n\n"
         )
+    warning_block = ""
+    if unverified_refs:
+        refs_list = ", ".join(unverified_refs)
+        warning_block = (
+            f"--- ⚠ UNVERIFIED REFS ---\n"
+            f"This message claims evidence that did NOT resolve in this workdir: {refs_list}\n"
+            f"Treat the claim below as unconfirmed until you check it yourself.\n"
+            f"--- end warning ---\n\n"
+        )
     kind = mess.get("kind", "fyi")
     refs = mess.get("refs") or []
     refs_line = ", ".join(refs) if refs else "(none)"
     return (
         label_block
+        + warning_block
         + f"You are participating in a Mess&Jar peer conversation.\n"
         f"You are agent `{mess.get('to')}` receiving a `{kind}` from `{mess.get('from')}`.\n"
         f"Jar: {mess.get('jar_id')}  Mess: {mess.get('id')}  Hop: {mess.get('hop', 0)}\n"

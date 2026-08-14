@@ -10,7 +10,8 @@ from typing import Any
 from messjar.client import BusClient
 from messjar.daemon.adapters import get_adapter
 from messjar.localstate import killswitch_state
-from messjar.notify import notify_circuit_trip, notify_mess
+from messjar.notify import notify_circuit_trip, notify_mess, notify_unverified_ref
+from messjar.refs import has_verifiable_ref, verify_ref
 from messjar.schema import WAKE_KINDS, MessKind
 
 log = logging.getLogger("messjar.daemon")
@@ -159,13 +160,31 @@ class Daemon:
             return
 
         session_id = local.get("session_id")
+        workdir = local.get("workdir") or self.workdir
+
+        # Refs are load-bearing for answer/artifact — Mess.create() already
+        # required at least one verifiable-shaped ref to exist; here we check
+        # whether it actually resolves in *this* workdir. A mismatch doesn't
+        # block delivery (the human/agent still needs to see the content),
+        # but it must not be silently trusted — surfaced in the prompt and
+        # via desktop notification instead.
+        unverified_refs: list[str] = []
+        if kind in (MessKind.answer.value, MessKind.artifact.value):
+            unverified_refs = [
+                r for r in (mess.get("refs") or []) if verify_ref(r, workdir) is False
+            ]
+            if unverified_refs:
+                log.warning("unverified refs on mess=%s: %s", mess.get("id"), unverified_refs)
+                notify_unverified_ref(jar, mess, unverified_refs)
+
         result = self.adapter.invoke(
             mess,
-            workdir=local.get("workdir") or self.workdir,
+            workdir=workdir,
             session_id=session_id,
             dry_run=self.dry_run or not self.adapter.available(),
             readonly=readonly,
             label=jar.get("label"),
+            unverified_refs=unverified_refs or None,
         )
         if result.dry_run:
             log.info("dry-run cmd=%s", result.command)
@@ -188,19 +207,27 @@ class Daemon:
             and result.reply_body
             and result.reply_kind
         ):
+            reply_kind = result.reply_kind
+            reply_refs = list(result.refs) if result.refs else []
+            if reply_kind in ("answer", "artifact") and not has_verifiable_ref(reply_refs):
+                # No adapter today populates InvokeResult.refs with real
+                # evidence, so an auto-reply can't honestly claim to be an
+                # answer — Mess.create() would reject it anyway. Keep the
+                # thread alive as a question rather than going quiet.
+                reply_kind = "question"
             reply = self.bus.send(
                 jar["id"],
                 from_agent=self.agent_id,
                 to_agent=mess["from"],
                 body=result.reply_body,
-                kind=result.reply_kind,
+                kind=reply_kind,
                 # Mirror the incoming Mess's reply_expected so a
                 # question<->answer exchange can actually continue — this is
                 # the one place in the codebase that autonomously generates
                 # a Mess with no human at the keyboard, hence trigger_source.
                 reply_expected=mess.get("reply_expected", False),
                 hop=hop + 1,
-                refs=[f"mess:{mess['id']}"],
+                refs=reply_refs + [f"mess:{mess['id']}"],
                 trigger_source="agent",
             )
-            log.info("sent reply id=%s hop=%s", reply.get("id"), hop + 1)
+            log.info("sent reply id=%s hop=%s kind=%s", reply.get("id"), hop + 1, reply_kind)

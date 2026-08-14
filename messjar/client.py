@@ -76,6 +76,16 @@ class BusClient:
         r.raise_for_status()
         return r.json()
 
+    def digest(self, *, jar: str | None = None, agent: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if jar:
+            params["jar"] = jar
+        if agent:
+            params["agent"] = agent
+        r = self._client.get("/digest", params=params)
+        r.raise_for_status()
+        return r.json()
+
     def send(
         self,
         jar: str,

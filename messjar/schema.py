@@ -14,9 +14,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from messjar.refs import has_verifiable_ref
+
 SCHEMA_VERSION = 1
 MAX_BODY_BYTES = 256 * 1024  # 256 KiB — sized for content, not novels
 LABEL_MAX_BYTES = 2048  # ~2KB — a summary, not a spec dump
+LOOP_TIMEOUT_S = 24 * 60 * 60  # a loop with no answer in a day surfaces as stale
 
 
 class MessKind(str, Enum):
@@ -120,6 +123,11 @@ class Mess(BaseModel):
     schema_version: int = SCHEMA_VERSION
     seq: int | None = None  # assigned by store
     trigger_source: Literal["human", "agent"] = "human"
+    # Non-null only on the message that opened a loop (loop_id == own id).
+    # A closing reply is recognized via a `mess:<loop_id>` ref, not a second
+    # column here — see Store.send().
+    loop_id: str | None = None
+    loop_state: Literal["open", "answered", "stale"] | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -142,6 +150,12 @@ class Mess(BaseModel):
         body_bytes = body.encode("utf-8")
         if len(body_bytes) > MAX_BODY_BYTES:
             raise ValueError(f"body exceeds {MAX_BODY_BYTES} bytes")
+        refs = refs or []
+        if kind in (MessKind.answer, MessKind.artifact) and not has_verifiable_ref(refs):
+            raise ValueError(
+                f"kind={kind.value} requires a verifiable ref "
+                f"(sha:<commit>, file:<path>, or test:<summary>) in refs"
+            )
         if reply_expected is None:
             reply_expected = kind in (MessKind.question, MessKind.handoff)
         return cls(
@@ -152,7 +166,7 @@ class Mess(BaseModel):
             kind=kind,
             reply_expected=reply_expected,
             hop=hop,
-            refs=refs or [],
+            refs=refs,
             ts=_now(),
             schema_version=SCHEMA_VERSION,
             trigger_source=trigger_source,  # type: ignore[arg-type]

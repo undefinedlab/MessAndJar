@@ -52,6 +52,14 @@ def notify_circuit_trip(jar: dict[str, Any]) -> bool:
     return notify(title, body, urgency="critical")
 
 
+def notify_unverified_ref(jar: dict[str, Any], mess: dict[str, Any], failed_refs: list[str]) -> bool:
+    jar_name = jar.get("name") or jar.get("id") or "jar"
+    sender = mess.get("from") or "?"
+    title = f"Mess&Jar · {jar_name}"
+    body = f"unverified ref from {sender}: {', '.join(failed_refs)}"
+    return notify(title, body, urgency="critical")
+
+
 def _linux(title: str, body: str, *, urgency: str) -> bool:
     if shutil.which("notify-send"):
         subprocess.run(

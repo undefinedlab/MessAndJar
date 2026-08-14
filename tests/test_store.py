@@ -46,7 +46,10 @@ def test_wake_kinds_consistency() -> None:
     assert MessKind.fyi not in WAKE_KINDS
     assert MessKind.artifact not in WAKE_KINDS
     for kind in MessKind:
-        m = Mess.create(jar_id="jar_x", from_agent="a", to_agent="b", body="x", kind=kind)
+        # answer/artifact require a verifiable ref as of Task 3 (refs.py) —
+        # unrelated to WAKE_KINDS membership, just needed to construct one.
+        refs = ["sha:abc123"] if kind in (MessKind.answer, MessKind.artifact) else []
+        m = Mess.create(jar_id="jar_x", from_agent="a", to_agent="b", body="x", kind=kind, refs=refs)
         assert m.wakes_agent() == (kind in WAKE_KINDS)
 
 
