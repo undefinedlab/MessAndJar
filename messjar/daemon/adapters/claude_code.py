@@ -26,9 +26,10 @@ class ClaudeCodeAdapter(Adapter):
         dry_run: bool = False,
         readonly: bool = False,
         label: str | None = None,
+        unverified_refs: list[str] | None = None,
     ) -> InvokeResult:
         claude = self.binary(["claude"])
-        prompt = build_prompt(mess, label=label)
+        prompt = build_prompt(mess, label=label, unverified_refs=unverified_refs)
         cmd = [claude or "claude", "-p", prompt, "--output-format", "text"]
         if readonly:
             cmd.extend(["--allowedTools", READONLY_ALLOWED_TOOLS])

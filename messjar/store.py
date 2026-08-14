@@ -6,6 +6,7 @@ import json
 import os
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -15,6 +16,7 @@ from psycopg_pool import ConnectionPool
 from messjar.schema import (
     DEFAULT_CIRCUIT,
     LABEL_MAX_BYTES,
+    LOOP_TIMEOUT_S,
     WAKE_KINDS,
     AgentLocalState,
     Jar,
@@ -179,6 +181,13 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_label_proposals_jar ON label_proposals (jar_id, status);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_approvals_proposal_participant
                     ON approvals (proposal_id, participant);
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE messes ADD COLUMN IF NOT EXISTS loop_id TEXT;
+                ALTER TABLE messes ADD COLUMN IF NOT EXISTS loop_state TEXT;
+                CREATE INDEX IF NOT EXISTS idx_messes_loop ON messes (jar_id, loop_state);
                 """
             )
             conn.commit()
@@ -661,12 +670,19 @@ class Store:
                     ).fetchone()
                     seq = int(row["m"]) + 1
                     mess.seq = seq
+                    # A message expecting a reply opens a loop rooted at itself.
+                    # Closing a loop is handled below via a `mess:<id>` ref, not
+                    # a second column here — see Mess.loop_id's docstring.
+                    if mess.reply_expected:
+                        mess.loop_id = mess.id
+                        mess.loop_state = "open"
                     conn.execute(
                         """
                         INSERT INTO messes (
                             id, jar_id, seq, from_agent, to_agent, body, kind,
-                            reply_expected, hop, refs_json, ts, schema_version, trigger_source
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+                            reply_expected, hop, refs_json, ts, schema_version, trigger_source,
+                            loop_id, loop_state
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
                         """,
                         (
                             mess.id,
@@ -682,8 +698,20 @@ class Store:
                             mess.ts,
                             mess.schema_version,
                             mess.trigger_source,
+                            mess.loop_id,
+                            mess.loop_state,
                         ),
                     )
+                    if mess.kind == MessKind.answer:
+                        opened_ids = [
+                            r[len("mess:") :] for r in mess.refs if r.startswith("mess:")
+                        ]
+                        for opened_id in opened_ids:
+                            conn.execute(
+                                "UPDATE messes SET loop_state = 'answered' "
+                                "WHERE id = %s AND jar_id = %s AND loop_state = 'open'",
+                                (opened_id, jar.id),
+                            )
                     sender = jar.local.get(mess.from_agent) or AgentLocalState(agent_id=mess.from_agent)
                     sender.hop = max(sender.hop, mess.hop)
                     jar.local[mess.from_agent] = sender
@@ -720,6 +748,59 @@ class Store:
         with self._pool.connection() as conn:
             rows = conn.execute(q, params).fetchall()
         return [self._row_to_mess(r) for r in rows]
+
+    def list_open_loops(self, jar_id_or_name: str, *, to_agent: str | None = None) -> list[Mess]:
+        """Open + stale loops for a jar. Lazily flips any 'open' loop past
+        LOOP_TIMEOUT_S to 'stale' before reading — same eventually-consistent
+        pattern as the circuit breaker's rolling window, no cron needed."""
+        jar = self.get_jar(jar_id_or_name)
+        if not jar:
+            raise KeyError(f"jar not found: {jar_id_or_name}")
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=LOOP_TIMEOUT_S)
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE messes SET loop_state = 'stale' "
+                "WHERE jar_id = %s AND loop_state = 'open' AND ts < %s",
+                (jar.id, cutoff),
+            )
+            conn.commit()
+            q = "SELECT * FROM messes WHERE jar_id = %s AND loop_state IN ('open', 'stale')"
+            params: list[Any] = [jar.id]
+            if to_agent:
+                q += " AND to_agent = %s"
+                params.append(to_agent)
+            q += " ORDER BY ts ASC"
+            rows = conn.execute(q, params).fetchall()
+        return [self._row_to_mess(r) for r in rows]
+
+    def digest(
+        self, *, agent_id: str | None = None, jar_id_or_name: str | None = None
+    ) -> list[dict[str, Any]]:
+        """'What am I blocked on?' in one call — across every jar by default."""
+        if jar_id_or_name:
+            found = self.get_jar(jar_id_or_name)
+            jars = [found] if found else []
+        else:
+            jars = self.list_jars(agent_id)
+        out: list[dict[str, Any]] = []
+        for jar in jars:
+            loops = self.list_open_loops(jar.id)
+            open_loops = [m for m in loops if m.loop_state == "open"]
+            stale_loops = [m for m in loops if m.loop_state == "stale"]
+            waiting_on_you = [m for m in open_loops if agent_id and m.to_agent == agent_id]
+            recent_all = self.list_messes(jar.id, after_seq=0, limit=1000)
+            recent = list(reversed(recent_all[-5:]))
+            out.append(
+                {
+                    "jar": jar.name,
+                    "jar_id": jar.id,
+                    "open_loops": [m.model_dump(by_alias=True) for m in open_loops],
+                    "stale_loops": [m.model_dump(by_alias=True) for m in stale_loops],
+                    "waiting_on_you": [m.model_dump(by_alias=True) for m in waiting_on_you],
+                    "recent": [m.model_dump(by_alias=True) for m in recent],
+                }
+            )
+        return out
 
     def check_jar(
         self,
@@ -826,6 +907,8 @@ class Store:
             schema_version=row["schema_version"],
             seq=row["seq"],
             trigger_source=row.get("trigger_source") or "human",
+            loop_id=row.get("loop_id"),
+            loop_state=row.get("loop_state"),
         )
 
     def _row_to_proposal(self, row: dict[str, Any]) -> LabelProposal:

@@ -228,6 +228,75 @@ def resume_jar(
     console.print(f"resumed [cyan]{j['name']}[/]")
 
 
+def _age_str(ts: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return ts
+    secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _loop_line(m: dict) -> str:
+    preview = (m.get("body") or "").strip().replace("\n", " ")
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    return f"[dim]{_age_str(m.get('ts', ''))} ago[/] {m.get('kind')} {m.get('from')} → {m.get('to')}: {preview}"
+
+
+@app.command("digest")
+def digest_cmd(
+    jar: Optional[str] = typer.Argument(None, help="Limit to one jar (default: every jar)"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Show what's waiting on this agent"),
+    bus: str = typer.Option(DEFAULT_BUS, "--bus", envvar="MESSJAR_BUS"),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", envvar="MESSJAR_PASSWORD"
+    ),
+) -> None:
+    """What moved, what's open, what's waiting on you — across every jar. Your re-entry point."""
+    with _client(bus, password) as c:
+        entries = c.digest(jar=jar, agent=agent)
+    if not entries:
+        console.print("[dim]nothing to show[/]")
+        return
+    for entry in entries:
+        console.print(f"[bold cyan]{entry['jar']}[/]")
+        waiting = entry.get("waiting_on_you") or []
+        waiting_ids = {m["id"] for m in waiting}
+        if waiting:
+            console.print(f"  [bold yellow]waiting on you ({len(waiting)})[/]")
+            for m in waiting:
+                console.print(f"    {_loop_line(m)}")
+        open_loops = [m for m in (entry.get("open_loops") or []) if m["id"] not in waiting_ids]
+        if open_loops:
+            console.print(f"  open ({len(open_loops)})")
+            for m in open_loops:
+                console.print(f"    {_loop_line(m)}")
+        stale = entry.get("stale_loops") or []
+        if stale:
+            console.print(f"  [red]stale ({len(stale)})[/]")
+            for m in stale:
+                console.print(f"    {_loop_line(m)}")
+        recent = entry.get("recent") or []
+        if recent:
+            console.print("  recent:")
+            for m in recent:
+                console.print(
+                    f"    [dim]{_age_str(m.get('ts', ''))} ago[/] {m['kind']} {m['from']} → {m['to']}"
+                )
+        if not waiting and not open_loops and not stale and not recent:
+            console.print("  [dim](quiet)[/]")
+        console.print()
+
+
 def _read_body(body: Optional[str], body_file: Optional[Path]) -> str:
     if body is not None:
         return body

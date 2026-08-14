@@ -617,6 +617,30 @@ def create_app(store: Store) -> FastAPI:
             for m in store.list_messes(jar, after_seq=after_seq, limit=limit)
         ]
 
+    @app.get("/digest")
+    def digest(
+        jar: str | None = None,
+        agent: str | None = None,
+        auth: AuthContext = Depends(resolve_auth),
+    ) -> list[dict[str, Any]]:
+        """'What am I blocked on?' — one call, across every jar by default."""
+        if jar:
+            found = store.get_jar(jar)
+            if not found:
+                raise HTTPException(404, "jar not found")
+            require_jar_access(auth, found)
+            effective_agent = agent or (None if (auth.admin or auth.open_bus) else auth.agent_id)
+            return store.digest(agent_id=effective_agent, jar_id_or_name=found.id)
+        if auth.admin or auth.open_bus:
+            return store.digest(agent_id=agent, jar_id_or_name=None)
+        if auth.agent_id:
+            return store.digest(agent_id=agent or auth.agent_id, jar_id_or_name=None)
+        # jar-password auth with no explicit jar= — scope to that one jar
+        found = store.get_jar(auth.jar_id or "")
+        if not found:
+            return []
+        return store.digest(agent_id=agent, jar_id_or_name=found.id)
+
     @app.post("/send")
     def send_rest(body: SendBody, auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
         jar = pick_jar(

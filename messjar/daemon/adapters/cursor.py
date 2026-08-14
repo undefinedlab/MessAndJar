@@ -23,9 +23,10 @@ class CursorAdapter(Adapter):
         dry_run: bool = False,
         readonly: bool = False,
         label: str | None = None,
+        unverified_refs: list[str] | None = None,
     ) -> InvokeResult:
         binary = self.binary(["cursor-agent", "agent", "cursor"])
-        prompt = build_prompt(mess, label=label)
+        prompt = build_prompt(mess, label=label, unverified_refs=unverified_refs)
         # Prefer print/headless style; fall back to generic argv
         if binary and binary.endswith("cursor") and "agent" not in binary:
             cmd = [binary, "agent", "-p", prompt]
