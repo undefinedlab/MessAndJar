@@ -7,7 +7,7 @@ artifacts are first-class via kind=artifact and refs.
 from __future__ import annotations
 
 import difflib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
@@ -20,6 +20,9 @@ SCHEMA_VERSION = 1
 MAX_BODY_BYTES = 256 * 1024  # 256 KiB — sized for content, not novels
 LABEL_MAX_BYTES = 2048  # ~2KB — a summary, not a spec dump
 LOOP_TIMEOUT_S = 24 * 60 * 60  # a loop with no answer in a day surfaces as stale
+HELD_TIMEOUT_S = 24 * 60 * 60  # an unreviewed held message is dropped, never auto-sent
+
+DEFAULT_POLICY: dict[str, list[str]] = {"held_kinds": ["handoff", "artifact"]}
 
 
 class MessKind(str, Enum):
@@ -63,6 +66,7 @@ class Jar(BaseModel):
     paused_reason: str | None = None
     circuit: dict[str, int] = Field(default_factory=lambda: dict(DEFAULT_CIRCUIT))
     label: str | None = None
+    policy: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_POLICY))
 
     @classmethod
     def create(
@@ -225,6 +229,62 @@ def label_diff(old: str | None, new: str) -> str:
     return "".join(
         difflib.unified_diff(old_lines, new_lines, fromfile="current label", tofile="proposed label")
     )
+
+
+class HeldMessage(BaseModel):
+    """A Held-tier Mess (kind=handoff/artifact, trigger_source=agent) awaiting
+    the sender's human before it's delivered. Lives outside `messes` entirely
+    — it never occupies a `seq` until approved, which is what lets approval
+    just be a fresh Store.send() call instead of a second copy of that
+    transaction's circuit-breaker/loop-tracking logic rewritten as an update.
+    """
+
+    id: str
+    jar_id: str
+    from_agent: str
+    to_agent: str
+    body: str
+    kind: MessKind
+    reply_expected: bool = False
+    hop: int = 0
+    refs: list[str] = Field(default_factory=list)
+    trigger_source: Literal["human", "agent"] = "agent"
+    status: Literal["held", "sent", "dropped"] = "held"
+    created_at: str
+    held_until: str
+    approved_by: str | None = None
+    decided_at: str | None = None
+    sent_mess_id: str | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        jar_id: str,
+        from_agent: str,
+        to_agent: str,
+        body: str,
+        kind: MessKind,
+        reply_expected: bool,
+        hop: int,
+        refs: list[str],
+        trigger_source: str,
+    ) -> HeldMessage:
+        held_until = datetime.now(timezone.utc) + timedelta(seconds=HELD_TIMEOUT_S)
+        return cls(
+            id=f"held_{uuid4().hex[:12]}",
+            jar_id=jar_id,
+            from_agent=from_agent,
+            to_agent=to_agent,
+            body=body,
+            kind=kind,
+            reply_expected=reply_expected,
+            hop=hop,
+            refs=refs,
+            trigger_source=trigger_source,  # type: ignore[arg-type]
+            created_at=_now(),
+            held_until=held_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
 
 
 def _now() -> str:

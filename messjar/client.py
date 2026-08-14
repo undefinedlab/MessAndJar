@@ -120,6 +120,33 @@ class BusClient:
         r.raise_for_status()
         return r.json()
 
+    def set_policy(self, jar: str, **cfg: Any) -> dict[str, Any]:
+        r = self._client.post(f"/jars/{jar}/policy", json=cfg)
+        r.raise_for_status()
+        return r.json()
+
+    def list_held(self, jar: str, *, from_agent: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if from_agent:
+            params["from_agent"] = from_agent
+        r = self._client.get(f"/jars/{jar}/held", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def approve_held(self, jar: str, held_id: str, *, approved_by: str) -> dict[str, Any]:
+        r = self._client.post(
+            f"/jars/{jar}/held/{held_id}/approve", json={"approved_by": approved_by}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def reject_held(self, jar: str, held_id: str, *, rejected_by: str | None = None) -> dict[str, Any]:
+        r = self._client.post(
+            f"/jars/{jar}/held/{held_id}/reject", json={"rejected_by": rejected_by}
+        )
+        r.raise_for_status()
+        return r.json()
+
     def propose_label(
         self, jar: str, *, agent: str, patch: str, origin_mess_id: str | None = None
     ) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from messjar import policy
 from messjar.auth import AuthContext
 from messjar.schema import Mess, MessKind
 from messjar.store import Store
@@ -143,7 +144,8 @@ def build_mcp() -> FastMCP:
             refs=refs or [],
             trigger_source=trigger_source,
         )
-        return store.send(mess).model_dump(by_alias=True)
+        result = policy.send(store, mess, client="mcp")
+        return policy.public_dict(result)
 
     @mcp.tool
     def update_label(

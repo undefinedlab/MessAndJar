@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -20,8 +20,10 @@ from messjar.auth import (
     extract_password,
     passwords_match,
 )
+from messjar import policy
 from messjar.mcp_auth_asgi import mcp_auth_middleware
 from messjar.mcp_protocol import build_mcp
+from messjar.policy import ScopeViolation
 from messjar.schema import AgentLocalState, Jar, LabelProposal, Mess, MessKind, label_diff
 from messjar.share import agent_mcp_bundle, connection_bundle
 from messjar.store import CircuitBreakerTripped, Store, database_host_label, normalize_database_url
@@ -129,6 +131,18 @@ class CircuitConfigBody(BaseModel):
     max_spawns: int | None = None
     window_s: int | None = None
     max_hop_depth: int | None = None
+
+
+class PolicyConfigBody(BaseModel):
+    held_kinds: list[str] | None = None
+
+
+class HeldApproveBody(BaseModel):
+    approved_by: str
+
+
+class HeldRejectBody(BaseModel):
+    rejected_by: str | None = None
 
 
 class LabelProposeBody(BaseModel):
@@ -536,6 +550,68 @@ def create_app(store: Store) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
 
+    @app.post("/jars/{jar}/policy")
+    def set_jar_policy(
+        jar: str, body: PolicyConfigBody, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        cfg = {k: v for k, v in body.model_dump().items() if v is not None}
+        try:
+            return store.set_jar_policy(jar, cfg).public_dict()
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.get("/jars/{jar}/held")
+    def list_held(
+        jar: str, from_agent: str | None = None, auth: AuthContext = Depends(resolve_auth)
+    ) -> list[dict[str, Any]]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        return [h.model_dump() for h in store.list_held_messages(jar, from_agent=from_agent)]
+
+    @app.post("/jars/{jar}/held/{held_id}/approve")
+    def approve_held(
+        jar: str, held_id: str, body: HeldApproveBody, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        try:
+            return store.approve_held_message(
+                held_id, approved_by=body.approved_by, client="api"
+            ).model_dump(by_alias=True)
+        except CircuitBreakerTripped as e:
+            raise HTTPException(429, str(e)) from e
+        except ScopeViolation as e:
+            raise HTTPException(403, str(e)) from e
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except (ValueError, RuntimeError) as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.post("/jars/{jar}/held/{held_id}/reject")
+    def reject_held(
+        jar: str, held_id: str, body: HeldRejectBody, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
+        j = store.get_jar(jar)
+        if not j:
+            raise HTTPException(404, "jar not found")
+        require_jar_access(auth, j)
+        try:
+            return store.reject_held_message(
+                held_id, rejected_by=body.rejected_by, client="api"
+            ).model_dump()
+        except KeyError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
     @app.post("/jars/{jar}/label/propose")
     def propose_label(
         jar: str, body: LabelProposeBody, auth: AuthContext = Depends(resolve_auth)
@@ -642,7 +718,9 @@ def create_app(store: Store) -> FastAPI:
         return store.digest(agent_id=agent, jar_id_or_name=found.id)
 
     @app.post("/send")
-    def send_rest(body: SendBody, auth: AuthContext = Depends(resolve_auth)) -> dict[str, Any]:
+    def send_rest(
+        body: SendBody, response: Response, auth: AuthContext = Depends(resolve_auth)
+    ) -> dict[str, Any]:
         jar = pick_jar(
             auth,
             agent=body.from_agent,
@@ -652,7 +730,10 @@ def create_app(store: Store) -> FastAPI:
         )
         assert jar is not None
         body.jar = jar.name
-        return _send(store, body)
+        result = _send(store, body)
+        if result.get("status") == "held":
+            response.status_code = 202  # queued for the sender's human, not delivered
+        return result
 
     @app.post("/ack")
     def ack(body: AckBody, auth: AuthContext = Depends(resolve_auth)) -> dict[str, str]:
@@ -994,9 +1075,12 @@ def _send(store: Store, body: SendBody) -> dict[str, Any]:
             refs=body.refs,
             trigger_source=body.trigger_source,
         )
-        return store.send(mess).model_dump(by_alias=True)
+        result = policy.send(store, mess, client="api")
+        return policy.public_dict(result)
     except CircuitBreakerTripped as e:
         raise HTTPException(429, str(e)) from e
+    except ScopeViolation as e:
+        raise HTTPException(403, str(e)) from e
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e)) from e
 
