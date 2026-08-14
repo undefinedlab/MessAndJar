@@ -37,12 +37,17 @@ class Adapter(ABC):
         session_id: str | None,
         dry_run: bool = False,
         readonly: bool = False,
+        label: str | None = None,
     ) -> InvokeResult:
         """Turn a Mess into a tool run. May resume session_id when supported.
 
         readonly=True means this spawn was caused by another agent's message
         (trigger_source="agent"), not a human — the invocation must not be
         able to write to the filesystem.
+
+        label is the jar's current agreed context (see schema.LabelProposal)
+        — injected above the message body so a decision made days ago
+        survives without replaying history.
         """
 
     def binary(self, candidates: list[str]) -> str | None:
@@ -53,13 +58,21 @@ class Adapter(ABC):
         return None
 
 
-def build_prompt(mess: dict[str, Any]) -> str:
+def build_prompt(mess: dict[str, Any], *, label: str | None = None) -> str:
     """Shared prompt wrapper so adapters stay thin."""
+    label_block = ""
+    if label:
+        label_block = (
+            f"--- jar label (persistent, agreed context — read this first) ---\n"
+            f"{label}\n"
+            f"--- end label ---\n\n"
+        )
     kind = mess.get("kind", "fyi")
     refs = mess.get("refs") or []
     refs_line = ", ".join(refs) if refs else "(none)"
     return (
-        f"You are participating in a Mess&Jar peer conversation.\n"
+        label_block
+        + f"You are participating in a Mess&Jar peer conversation.\n"
         f"You are agent `{mess.get('to')}` receiving a `{kind}` from `{mess.get('from')}`.\n"
         f"Jar: {mess.get('jar_id')}  Mess: {mess.get('id')}  Hop: {mess.get('hop', 0)}\n"
         f"Refs: {refs_line}\n"

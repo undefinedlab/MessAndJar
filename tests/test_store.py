@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -54,21 +53,6 @@ def test_wake_kinds_consistency() -> None:
 def test_password_compare() -> None:
     assert passwords_match("secret", "secret")
     assert extract_password("Bearer abc", None) == "abc"
-
-
-@pytest.fixture(scope="module")
-def database_url() -> str:
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        pytest.skip("DATABASE_URL not set")
-    return url
-
-
-@pytest.fixture()
-def store(database_url: str) -> Store:
-    s = Store(database_url, min_size=1, max_size=2)
-    yield s
-    s.close()
 
 
 def test_empty_jar_and_attach(store: Store) -> None:

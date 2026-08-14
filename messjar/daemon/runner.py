@@ -165,6 +165,7 @@ class Daemon:
             session_id=session_id,
             dry_run=self.dry_run or not self.adapter.available(),
             readonly=readonly,
+            label=jar.get("label"),
         )
         if result.dry_run:
             log.info("dry-run cmd=%s", result.command)

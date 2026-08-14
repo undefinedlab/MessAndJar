@@ -6,6 +6,7 @@ artifacts are first-class via kind=artifact and refs.
 
 from __future__ import annotations
 
+import difflib
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 SCHEMA_VERSION = 1
 MAX_BODY_BYTES = 256 * 1024  # 256 KiB — sized for content, not novels
+LABEL_MAX_BYTES = 2048  # ~2KB — a summary, not a spec dump
 
 
 class MessKind(str, Enum):
@@ -57,6 +59,7 @@ class Jar(BaseModel):
     repos: list[str] = Field(default_factory=list)
     paused_reason: str | None = None
     circuit: dict[str, int] = Field(default_factory=lambda: dict(DEFAULT_CIRCUIT))
+    label: str | None = None
 
     @classmethod
     def create(
@@ -158,6 +161,56 @@ class Mess(BaseModel):
     def wakes_agent(self) -> bool:
         """Daemon: should this Mess spawn a tool session now?"""
         return self.kind in WAKE_KINDS
+
+
+class LabelProposal(BaseModel):
+    """A pending change to a jar's label — a proposal, not a mutation.
+
+    Applies to `jars.label` only once every current participant has
+    accepted this exact `patch`. `accepted_by` / `diff` are not stored on
+    this model — they're computed from the `approvals` table and from
+    `label_diff(base_label, patch)` by the layer serializing this for
+    display (Store stays focused on persistence).
+    """
+
+    id: str
+    jar_id: str
+    proposed_by: str
+    base_label: str | None = None
+    patch: str
+    origin_mess_id: str | None = None
+    status: Literal["pending", "applied", "rejected"] = "pending"
+    created_at: str
+    decided_at: str | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        jar_id: str,
+        proposed_by: str,
+        patch: str,
+        base_label: str | None = None,
+        origin_mess_id: str | None = None,
+    ) -> LabelProposal:
+        return cls(
+            id=f"prop_{uuid4().hex[:12]}",
+            jar_id=jar_id,
+            proposed_by=proposed_by,
+            base_label=base_label,
+            patch=patch,
+            origin_mess_id=origin_mess_id,
+            created_at=_now(),
+        )
+
+
+def label_diff(old: str | None, new: str) -> str:
+    """Display-only unified diff between the current and proposed label."""
+    old_lines = (old or "").splitlines(keepends=True)
+    new_lines = (new or "").splitlines(keepends=True)
+    return "".join(
+        difflib.unified_diff(old_lines, new_lines, fromfile="current label", tofile="proposed label")
+    )
 
 
 def _now() -> str:
